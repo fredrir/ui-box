@@ -175,6 +175,53 @@ mod tests {
         )));
     }
 
+    fn config_for(backend: &str) -> crate::config::Config {
+        crate::config::Config::resolve_from(
+            &crate::config::Overrides {
+                backend: Some(backend.to_string()),
+                ..Default::default()
+            },
+            std::path::Path::new("/"),
+        )
+        .expect("config")
+    }
+
+    #[test]
+    fn an_ssh_backend_spawns_the_driver_on_the_lab_not_here() {
+        let mut config = config_for("ssh://fredrir@dlab-ui");
+        config.driver_dom = Some("/nix/store/abc-ui-box-dom/bin/ui-box-dom".to_string());
+        let spec = resolve(Surface::Web, &config).expect("spec");
+        assert!(
+            spec.remote,
+            "the display is on the lab, so the driver must be too"
+        );
+        assert_eq!(spec.argv[0], "ssh");
+        assert!(
+            spec.argv.contains(&"fredrir@dlab-ui".to_string()),
+            "{:?}",
+            spec.argv
+        );
+        assert_eq!(spec.argv.last().unwrap(), DOM_DRIVER_REMOTE);
+    }
+
+    #[test]
+    fn an_explicit_ssh_command_is_spawned_verbatim() {
+        let mut config = config_for("ssh://fredrir@dlab-ui");
+        config.driver_dom = Some("ssh dlab-ui ui-box-dom".to_string());
+        let spec = resolve(Surface::Web, &config).expect("spec");
+        assert!(spec.remote);
+        assert_eq!(spec.argv, vec!["ssh", "dlab-ui", "ui-box-dom"]);
+    }
+
+    #[test]
+    fn a_local_backend_spawns_the_driver_here() {
+        let mut config = config_for("local://");
+        config.driver_dom = Some("node drivers/dom/dist/main.js".to_string());
+        let spec = resolve(Surface::Web, &config).expect("spec");
+        assert!(!spec.remote);
+        assert_eq!(spec.argv, vec!["node", "drivers/dom/dist/main.js"]);
+    }
+
     #[test]
     fn a_remote_driver_is_labelled_with_its_host() {
         let mut config = crate::config::Config::resolve_from(
