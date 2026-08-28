@@ -199,8 +199,16 @@ fn a_path_the_driver_never_wrote_is_a_tool_failure_not_a_blank_page() {
     }
     let driver = format!("node {}", lying_driver().display());
     let opened = ui_box_with(&driver, &["open", "http://127.0.0.1:1/"]);
-    assert_eq!(code(&opened), 0, "{}", String::from_utf8_lossy(&opened.stderr));
-    let session = summary(&opened)["session"].as_str().expect("session").to_string();
+    assert_eq!(
+        code(&opened),
+        0,
+        "{}",
+        String::from_utf8_lossy(&opened.stderr)
+    );
+    let session = summary(&opened)["session"]
+        .as_str()
+        .expect("session")
+        .to_string();
 
     let snapped = ui_box_with(&driver, &["snap", &session, "--name", "ghost"]);
     let body = summary(&snapped);
@@ -214,5 +222,5 @@ fn a_path_the_driver_never_wrote_is_a_tool_failure_not_a_blank_page() {
     assert!(error.contains("ghost.txt"), "{error}");
     assert!(error.contains("no such file exists"), "{error}");
 
-    ui_box_with(&driver, &["close", &session]).status.code();
+    let _ = ui_box_with(&driver, &["close", &session]);
 }

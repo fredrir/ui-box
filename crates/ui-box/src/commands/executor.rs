@@ -61,7 +61,11 @@ impl Executor {
         let remote = PathBuf::from(remote);
         let Some(backend) = &self.backend else {
             if !remote.is_file() {
-                return Ok(Some(remote));
+                bail!(
+                    "driver {} reported writing {}, but no such file exists",
+                    self.conn.name(),
+                    remote.display()
+                );
             }
             if !remote.starts_with(&self.run.path) {
                 note!(
