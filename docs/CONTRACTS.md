@@ -323,3 +323,11 @@ Changing any of these means changing its consumers in the same commit.
 
 All four fail the same way when broken, which is the property worth protecting
 rather than any individual field.
+
+A heuristic for which invariants belong on this list, and which panics or
+unchecked accesses need hardening: IF CONVINCING YOURSELF IT HOLDS REQUIRED
+SURVEYING SEVERAL CALL SITES, A FUTURE READER WILL NOT DO THAT SURVEY. A guard
+on the adjacent line survives editing because whoever edits it sees it. An
+invariant established in another function, across several construction sites,
+does not -- and neither does one verified once by hand and reported in a
+message. Both are true for reasons nobody will encounter again.

@@ -97,11 +97,7 @@ impl Summary {
     }
 
     pub fn stream(&self) -> Stream {
-        if self.exit_code == EXIT_PASS {
-            self.stream
-        } else {
-            Stream::Stdout
-        }
+        self.stream
     }
 
     pub fn emit(&self) {
