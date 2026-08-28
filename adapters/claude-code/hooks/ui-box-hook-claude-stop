@@ -1,0 +1,54 @@
+#!/usr/bin/env sh
+set -u
+
+base=${UIBOX_VERIFY_BASE:-HEAD}
+limit=${UIBOX_VERIFY_TIMEOUT:-30}
+
+[ "${UIBOX_SKIP_VERIFY:-0}" = "1" ] && exit 0
+command -v ui-box >/dev/null 2>&1 || exit 0
+
+payload=$(cat 2>/dev/null) || exit 0
+
+if command -v jq >/dev/null 2>&1; then
+  active=$(printf '%s' "$payload" | jq -r '.stop_hook_active // false' 2>/dev/null)
+else
+  case "$payload" in
+    *'"stop_hook_active"'*true*) active=true ;;
+    *) active=false ;;
+  esac
+fi
+
+[ "$active" = "true" ] && exit 0
+
+git rev-parse --verify --quiet "$base" >/dev/null 2>&1 || exit 0
+
+if command -v timeout >/dev/null 2>&1; then
+  timeout "$limit" ui-box verify --since "$base"
+elif command -v gtimeout >/dev/null 2>&1; then
+  gtimeout "$limit" ui-box verify --since "$base"
+else
+  ui-box verify --since "$base"
+fi
+status=$?
+
+case "$status" in
+  1) ;;
+  2)
+    echo "ui-box could not run (exit 2); not gating completion" >&2
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+
+cat >&2 <<MSG
+You changed files that render, and ui-box has no passing run covering them.
+
+Run the UI live before finishing:
+  ui-box open <target>    then act/snap to check what you changed renders
+  ui-box run <flow.yaml>  if a committed spec already covers this flow
+
+A blank page or an empty text snapshot is a failure, not a pass. If the change
+genuinely renders nothing (docs, config, dead code), say so and stop again.
+MSG
+
+exit 2

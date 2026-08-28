@@ -1,0 +1,34 @@
+[package]
+name = "ui-box"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Harness-agnostic live UI testing"
+
+[[bin]]
+name = "ui-box"
+path = "src/main.rs"
+
+[lib]
+name = "ui_box"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+clap.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+ui-box-core = { path = "../ui-box-core" }
+ui-box-pipeline = { path = "../ui-box-pipeline", optional = true }
+
+[features]
+default = ["pipeline"]
+pipeline = ["dep:ui-box-pipeline"]
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+set -u
+
+[ "${UIBOX_SKIP_WAKE:-0}" = "1" ] && exit 0
+command -v ui-box >/dev/null 2>&1 || exit 0
+
+payload=$(cat 2>/dev/null) || exit 0
+
+if command -v jq >/dev/null 2>&1; then
+  paths=$(printf '%s' "$payload" | jq -r '
+    [.tool_input.file_path?, .tool_input.notebook_path?, (.tool_input.edits[]?.file_path?)]
+    | map(select(type == "string")) | .[]' 2>/dev/null)
+else
+  paths=$(printf '%s' "$payload" | sed -n 's/.*"file_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+fi
+
+[ -n "$paths" ] || exit 0
+
+renders=0
+for path in $paths; do
+  case "$path" in
+    *.tsx | *.jsx | *.vue | *.svelte | *.astro | *.css | *.scss | *.sass | *.less | *.html) renders=1 ;;
+    *.ts | *.js | *.mjs | *.rs)
+      case "$path" in
+        */components/* | */pages/* | */routes/* | */views/* | */layouts/* | */ui/* | */styles/*) renders=1 ;;
+      esac
+      ;;
+  esac
+done
+
+[ "$renders" -eq 1 ] || exit 0
+
+lock="${TMPDIR:-/tmp}/ui-box-wake.lock"
+mkdir "$lock" 2>/dev/null || exit 0
+
+nohup sh -c 'trap "rmdir \"$0\" 2>/dev/null" EXIT INT TERM; ui-box wake' "$lock" \
+  </dev/null >/dev/null 2>&1 &
+
+exit 0

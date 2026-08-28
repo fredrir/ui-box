@@ -1,0 +1,10 @@
+[package]
+name = "ui-box-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Backend abstraction shared by the ui-box core and the promotion pipeline"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true

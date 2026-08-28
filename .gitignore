@@ -1,0 +1,12 @@
+/target
+**/target
+
+.uibox/
+/artifacts/
+
+result
+result-*
+.direnv/
+
+*.log
+.DS_Store

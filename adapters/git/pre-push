@@ -1,0 +1,57 @@
+#!/usr/bin/env sh
+set -u
+
+base=${UIBOX_VERIFY_BASE:-origin/main}
+limit=${UIBOX_VERIFY_TIMEOUT:-300}
+
+[ "${UIBOX_SKIP_VERIFY:-0}" = "1" ] && exit 0
+command -v ui-box >/dev/null 2>&1 || exit 0
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+git rev-parse --verify --quiet "$base" >/dev/null 2>&1 || exit 0
+
+refs=0
+deletions_only=1
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  refs=$((refs + 1))
+  case "$local_sha" in
+    *[!0]*) deletions_only=0 ;;
+  esac
+done
+
+[ "$refs" -gt 0 ] && [ "$deletions_only" -eq 1 ] && exit 0
+
+if command -v timeout >/dev/null 2>&1; then
+  timeout "$limit" ui-box verify --since "$base"
+elif command -v gtimeout >/dev/null 2>&1; then
+  gtimeout "$limit" ui-box verify --since "$base"
+else
+  ui-box verify --since "$base"
+fi
+status=$?
+
+case "$status" in
+  1) ;;
+  2)
+    echo "ui-box: could not run (exit 2); the push is not blocked" >&2
+    exit 0
+    ;;
+  124 | 137)
+    echo "ui-box: verify exceeded ${limit}s; the push is not blocked" >&2
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+
+cat >&2 <<MSG
+
+ui-box: this push changes UI files that have no passing run since $base.
+
+  ui-box run <flow.yaml>       replay a committed spec
+  ui-box open <target>         start a session, then act/snap through it
+  ui-box record <session> -o <flow.yaml>
+                               freeze a working session into a spec and commit it
+
+Set UIBOX_SKIP_VERIFY=1 or push with --no-verify to override.
+MSG
+
+exit 1

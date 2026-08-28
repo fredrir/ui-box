@@ -1,0 +1,18 @@
+[package]
+name = "ui-box-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.88"
+description = "MCP server exposing ui-box to agent harnesses over stdio"
+
+[[bin]]
+name = "ui-box-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+rmcp = { version = "3.1", default-features = false, features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["fs", "io-std", "macros", "process", "rt-multi-thread", "time"] }

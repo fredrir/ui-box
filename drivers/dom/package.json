@@ -1,0 +1,38 @@
+{
+  "name": "@uibox/driver-dom",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ui-box DOM driver for the web and tauri surfaces",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "ui-box-dom": "./dist/main.js"
+  },
+  "main": "./dist/main.js",
+  "exports": {
+    ".": "./dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "start": "node dist/main.js",
+    "test": "node --test dist/test/*.test.js"
+  },
+  "dependencies": {
+    "playwright-core": "1.59.1",
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^22.10.0",
+    "@types/pngjs": "^6.0.5",
+    "typescript": "^5.7.2"
+  }
+}

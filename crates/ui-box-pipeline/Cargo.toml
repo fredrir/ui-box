@@ -1,0 +1,12 @@
+[package]
+name = "ui-box-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Artifact promotion between distro-lab labs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ui-box-core = { path = "../ui-box-core" }
