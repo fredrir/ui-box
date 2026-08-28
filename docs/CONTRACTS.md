@@ -239,6 +239,14 @@ A hook must never read 2 as a test failure. `wake` is fire-and-forget: it
 returns 0 as soon as the lab is reachable or the wake is in flight, and it
 never fails a caller.
 
+0, 1 and 2 are the only codes this contract defines. ANY OTHER CODE IS
+OFF-CONTRACT and means the binary did not get to report -- a Rust panic exits
+101, signal death exits 128+n, and neither is a verdict. A consumer must treat
+an undefined code as a tooling failure and must not have a catch-all that reads
+non-zero as "the UI failed". A non-zero exit forces the summary onto stdout, so
+an exit 1 carrying no parseable JSON line is likewise a broken binary rather
+than a result.
+
 ## 8. Absence read as success
 
 The recurring bug in a verification tool is not a wrong answer. It is a
@@ -284,3 +292,34 @@ claim the detail.
 When adding any check, ask what its answer is when there is nothing to check.
 If that answer is indistinguishable from success -- or from any definite
 answer -- it is this bug again.
+
+## 9. Load-bearing guarantees
+
+Named because an invariant nobody has written down is one nobody can protect.
+Every entry here is something a consumer's CORRECTNESS rests on, not merely its
+convenience. Breaking one does not produce a compile error -- it produces a
+tool that blames the user's application for something that is not its fault.
+
+Changing any of these means changing its consumers in the same commit.
+
+  1. `text_bytes` is the byte count of accessibility text HOWEVER THE DRIVER
+     CHOSE TO DELIVER IT -- inline, or measured from the file after it has been
+     pulled local. §1 leaves inlining optional, so deriving it only from the
+     inline field would make blank-page detection depend on a driver's choice.
+
+  2. A reported artifact path IMPLIES A FILE THAT EXISTS. `localise()` checks
+     both a driver naming a file it never wrote and a pull that reports success
+     without producing one. This is what lets a consumer discriminate "the file
+     is empty" from "nothing was delivered".
+
+  3. stdout ALWAYS carries exactly one JSON line with an `ok` field, and a
+     non-zero exit forces it regardless of what the call site asked for. This
+     is what lets exit 1 with no parseable line be read as a broken binary
+     rather than as a UI failure -- a rule that INVERTS a verdict, so it is
+     only safe while a failed summary cannot legitimately be absent.
+
+  4. The exit code means what §7 says. 0, 1, 2 and nothing else; any other code
+     is the binary failing to report, never a verdict.
+
+All four fail the same way when broken, which is the property worth protecting
+rather than any individual field.

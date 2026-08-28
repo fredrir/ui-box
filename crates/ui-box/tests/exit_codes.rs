@@ -7,6 +7,56 @@ fn artifacts() -> PathBuf {
     dir
 }
 
+fn node_available() -> bool {
+    Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn lying_driver() -> PathBuf {
+    let path = artifacts().join("lying-driver.js");
+    std::fs::write(
+        &path,
+        r#"
+const readline = require('readline');
+let n = 0;
+const dirs = new Map();
+readline.createInterface({ input: process.stdin }).on('line', (line) => {
+  if (!line.trim()) return;
+  const req = JSON.parse(line);
+  const verb = String(req.method).replace(/^driver\./, '');
+  let result = {};
+  if (verb === 'info') result = { name: 'dom', version: '0', surfaces: ['web'] };
+  else if (verb === 'open') {
+    const s = 'd' + (++n);
+    dirs.set(s, req.params.options.snapsDir);
+    result = { sessionId: s };
+  } else if (verb === 'snap') {
+    result = { name: 'ghost', txtPath: dirs.get(req.params.sessionId) + '/ghost.txt',
+               console: [], network: [] };
+  } else if (verb === 'act') result = { ok: true };
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\n');
+});
+"#,
+    )
+    .expect("driver fixture");
+    path
+}
+
+fn ui_box_with(driver: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ui-box"))
+        .args(args)
+        .env("UIBOX_ARTIFACTS", artifacts())
+        .env("UIBOX_BACKEND", "local://")
+        .env("UIBOX_HOME", artifacts())
+        .env("UIBOX_DRIVER_DOM", driver)
+        .env_remove("UIBOX_GOLDENS")
+        .output()
+        .expect("ui-box runs")
+}
+
 fn ui_box(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ui-box"))
         .args(args)
@@ -140,4 +190,29 @@ fn every_command_prints_one_json_line_on_stdout() {
             "{args:?} has no ok field"
         );
     }
+}
+
+#[test]
+fn a_path_the_driver_never_wrote_is_a_tool_failure_not_a_blank_page() {
+    if !node_available() {
+        return;
+    }
+    let driver = format!("node {}", lying_driver().display());
+    let opened = ui_box_with(&driver, &["open", "http://127.0.0.1:1/"]);
+    assert_eq!(code(&opened), 0, "{}", String::from_utf8_lossy(&opened.stderr));
+    let session = summary(&opened)["session"].as_str().expect("session").to_string();
+
+    let snapped = ui_box_with(&driver, &["snap", &session, "--name", "ghost"]);
+    let body = summary(&snapped);
+    assert_eq!(
+        code(&snapped),
+        2,
+        "a phantom artifact must never be reportable as a UI result: {}",
+        snapped.status
+    );
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("ghost.txt"), "{error}");
+    assert!(error.contains("no such file exists"), "{error}");
+
+    ui_box_with(&driver, &["close", &session]).status.code();
 }
