@@ -19,6 +19,12 @@ pub const REQUEST_BANNER: &str = "\
 INVALID TOOL ARGUMENTS -- NOTHING WAS RUN.
 No ui-box command was executed, so nothing is known about the UI or the tooling.";
 
+pub const NOTHING_BANNER: &str = "\
+NOTHING WAS VERIFIED -- THIS IS NOT A PASS.
+verify exited 0 without replaying a single flow, so no UI was exercised and nothing was
+proven about it. Here a 0 means \"no work was done\", not \"the UI is correct\". Do not
+report the UI as verified on the strength of this result.";
+
 pub const BLANK_BANNER: &str = "\
 BLANK SNAPSHOT -- THE PAGE RENDERED NOTHING.
 The accessibility snapshot came back empty. Treat this as a failure of the thing under
@@ -63,6 +69,7 @@ pub struct Report {
     images: Vec<Vec<u8>>,
     facts: Map<String, Value>,
     failure: Option<(Domain, String)>,
+    inconclusive: Option<String>,
 }
 
 impl Report {
@@ -73,6 +80,7 @@ impl Report {
             images: Vec::new(),
             facts: Map::new(),
             failure: None,
+            inconclusive: None,
         }
     }
 
@@ -128,6 +136,13 @@ impl Report {
         self
     }
 
+    pub fn inconclusive(&mut self, reason: impl Into<String>) -> &mut Report {
+        if self.inconclusive.is_none() {
+            self.inconclusive = Some(reason.into());
+        }
+        self
+    }
+
     pub fn is_failed(&self) -> bool {
         self.failure.is_some()
     }
@@ -141,6 +156,17 @@ impl Report {
 
         match &invocation.landing {
             Landing::Passed => {}
+            Landing::Failed if invocation.summary().is_null() => {
+                self.failed(
+                    Domain::Tooling,
+                    format!(
+                        "`{}` exited 1 but printed no result line. Every run is supposed to \
+                         emit one JSON object, so this build is not behaving to contract and \
+                         its exit code cannot be read as a verdict about the UI.",
+                        crate::uibox::PROGRAM
+                    ),
+                );
+            }
             Landing::Failed => {
                 let reason = invocation
                     .error_message()
@@ -185,8 +211,13 @@ impl Report {
 
     pub fn build(&self) -> CallToolResult {
         let mut text = String::new();
-        if let Some((domain, reason)) = &self.failure {
-            text.push_str(domain.banner());
+        let preamble = match (&self.failure, &self.inconclusive) {
+            (Some((domain, reason)), _) => Some((domain.banner(), reason)),
+            (None, Some(reason)) => Some((NOTHING_BANNER, reason)),
+            (None, None) => None,
+        };
+        if let Some((banner, reason)) = preamble {
+            text.push_str(banner);
             text.push_str("\n\nreason: ");
             text.push_str(reason);
             if !self.headline.is_empty() {
@@ -208,14 +239,20 @@ impl Report {
         }
 
         let mut structured = self.facts.clone();
-        match &self.failure {
-            Some((domain, reason)) => {
+        match (&self.failure, &self.inconclusive) {
+            (Some((domain, reason)), _) => {
                 structured.insert("ok".to_string(), Value::Bool(false));
                 structured.insert("status".to_string(), Value::from(domain.status()));
                 structured.insert("failure_domain".to_string(), Value::from(domain.label()));
                 structured.insert("reason".to_string(), Value::from(reason.clone()));
             }
-            None => {
+            (None, Some(reason)) => {
+                structured.insert("ok".to_string(), Value::Bool(false));
+                structured.insert("status".to_string(), Value::from("nothing_verified"));
+                structured.insert("failure_domain".to_string(), Value::Null);
+                structured.insert("reason".to_string(), Value::from(reason.clone()));
+            }
+            (None, None) => {
                 structured.insert("ok".to_string(), Value::Bool(true));
                 structured.insert("status".to_string(), Value::from("passed"));
                 structured.insert("failure_domain".to_string(), Value::Null);

@@ -24,6 +24,8 @@ pub struct SessionRecord {
     pub viewport: Viewport,
     pub backend: String,
     pub run_dir: PathBuf,
+    #[serde(default)]
+    pub remote_run_dir: Option<PathBuf>,
     pub session_dir: PathBuf,
     pub created_unix: u64,
     pub last_used_unix: u64,

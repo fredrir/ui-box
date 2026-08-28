@@ -22,6 +22,7 @@ pub struct Events {
     pub console_dropped: usize,
     pub network_dropped: usize,
     pub cursor: Cursor,
+    pub readable: bool,
 }
 
 impl Events {
@@ -45,7 +46,14 @@ impl Events {
     }
 }
 
+pub fn unreadable() -> Events {
+    Events::default()
+}
+
 pub async fn events_since(run_dir: &Path, from: Cursor) -> Events {
+    if !run_dir.is_dir() {
+        return Events::default();
+    }
     let console_lines = read_lines(&run_dir.join(CONSOLE)).await;
     let network_lines = read_lines(&run_dir.join(NETWORK)).await;
 
@@ -75,6 +83,7 @@ pub async fn events_since(run_dir: &Path, from: Cursor) -> Events {
         console_dropped,
         network_dropped,
         cursor,
+        readable: true,
     }
 }
 

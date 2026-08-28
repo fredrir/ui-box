@@ -1,0 +1,176 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  COPYFILE_DISABLE: "1"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+    env:
+      VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cross linker
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt }}
+          target=$(printf '%s' "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          echo "CARGO_TARGET_${target}_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - run: >
+          cargo build --release --locked
+          --target ${{ matrix.target }}
+          --package ui-box --package ui-box-mcp
+
+      - name: package
+        run: |
+          name="ui-box-${VERSION}-${{ matrix.target }}"
+          out="target/${{ matrix.target }}/release"
+          mkdir -p dist
+          tar -C "$out" -czf "dist/${name}.tar.gz" ui-box ui-box-mcp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref_type == 'tag'
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: the tag and the built binary agree
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          tar -xzf "dist/ui-box-${TAG}-x86_64-unknown-linux-gnu.tar.gz" -C "$RUNNER_TEMP"
+          built=$("$RUNNER_TEMP/ui-box" --version | awk '{print $2}')
+          if [ "v${built}" != "$TAG" ]; then
+            echo "tag $TAG ships a binary that reports ${built}" >&2
+            echo "bump the workspace version before tagging" >&2
+            exit 1
+          fi
+
+      - name: checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz | tee SHA256SUMS
+
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber dist/*
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes dist/*
+          fi
+
+  image:
+    name: image
+    runs-on: ubuntu-latest
+    needs: [build, publish]
+    if: github.ref_type == 'tag'
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: unpack linux binaries
+        run: |
+          set -eu
+          for pair in amd64:x86_64-unknown-linux-gnu arm64:aarch64-unknown-linux-gnu; do
+            arch=${pair%%:*}
+            target=${pair#*:}
+            mkdir -p "image/linux/$arch"
+            tar -xzf "dist/ui-box-${VERSION}-${target}.tar.gz" -C "image/linux/$arch"
+          done
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

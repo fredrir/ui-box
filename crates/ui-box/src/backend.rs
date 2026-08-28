@@ -3,8 +3,8 @@ use anyhow::Result;
 use crate::config::{BackendSpec, Config};
 
 pub use ui_box_core::{
-    parse_proxy_hop, proxy_hop, shell_quote, wake, which, Backend, Cmd, LocalBackend, Output,
-    SshBackend,
+    parse_proxy_hop, proxy_hop, shell_quote, ssh_options, wake, which, Backend, Cmd, LocalBackend,
+    Output, SshBackend,
 };
 
 pub fn for_lab(config: &Config, lab: &str) -> Result<Box<dyn Backend>> {

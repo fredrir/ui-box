@@ -216,7 +216,7 @@ fn source_path(local: &Path) -> String {
     }
 }
 
-fn ssh_options() -> Vec<String> {
+pub fn ssh_options() -> Vec<String> {
     if let Ok(raw) = std::env::var("UIBOX_SSH_OPTS") {
         if !raw.trim().is_empty() {
             return raw.split_whitespace().map(str::to_string).collect();

@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 
+use crate::backend::Backend;
 use crate::driver::Connection;
 use crate::flow::{SnapMode, SnapStep, Step};
 use crate::note;
@@ -32,6 +33,7 @@ pub struct Executor {
     pub default_mode: SnapMode,
     pub total: usize,
     pub failed: usize,
+    pub backend: Option<Box<dyn Backend>>,
 }
 
 impl Executor {
@@ -43,7 +45,56 @@ impl Executor {
             default_mode: SnapMode::Text,
             total: start_index,
             failed: 0,
+            backend: None,
         }
+    }
+
+    pub fn pulling_from(mut self, backend: Box<dyn Backend>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    fn localise(&self, remote: Option<&String>) -> Result<Option<PathBuf>> {
+        let Some(remote) = remote else {
+            return Ok(None);
+        };
+        let remote = PathBuf::from(remote);
+        let Some(backend) = &self.backend else {
+            if !remote.is_file() {
+                bail!(
+                    "driver {} reported writing {}, but no such file exists",
+                    self.conn.name(),
+                    remote.display()
+                );
+            }
+            if !remote.starts_with(&self.run.path) {
+                note!(
+                    "driver wrote {} outside the run directory",
+                    remote.display()
+                );
+            }
+            return Ok(Some(remote));
+        };
+        let name = remote.file_name().with_context(|| {
+            format!(
+                "driver returned {}, which has no file name",
+                remote.display()
+            )
+        })?;
+        let local = self.run.snaps_dir().join(name);
+        std::fs::create_dir_all(self.run.snaps_dir())?;
+        backend
+            .pull(&remote, &local)
+            .with_context(|| format!("cannot fetch {} from {}", remote.display(), backend.url()))?;
+        if !local.is_file() {
+            bail!(
+                "fetched {} from {} but nothing arrived at {}",
+                remote.display(),
+                backend.url(),
+                local.display()
+            );
+        }
+        Ok(Some(local))
     }
 
     pub fn perform(&mut self, step: &Step) -> Result<StepOutcome> {
@@ -125,12 +176,14 @@ impl Executor {
         if written != name {
             note!("driver stored snapshot {name} as {written}");
         }
+        let text_path = self.localise(snap.txt_path.as_ref())?;
+        let png_path = self.localise(snap.png_path.as_ref())?;
         let artifacts = SnapArtifacts {
             name: written.clone(),
             mode: mode.to_string(),
-            text_path: snap.txt_path.as_ref().map(PathBuf::from),
-            png_path: snap.png_path.as_ref().map(PathBuf::from),
-            text_bytes: snap.text.as_ref().map(String::len).unwrap_or_default(),
+            text_bytes: text_bytes(snap.text.as_deref(), text_path.as_deref()),
+            text_path,
+            png_path,
             console: snap.console.len(),
             network: snap.network.len(),
         };
@@ -139,14 +192,6 @@ impl Executor {
         }
         if mode.wants_png() && artifacts.png_path.is_none() {
             note!("driver wrote no png for snapshot {written}");
-        }
-        for path in [&artifacts.text_path, &artifacts.png_path]
-            .into_iter()
-            .flatten()
-        {
-            if !path.starts_with(&self.run.path) {
-                note!("driver wrote {} outside the run directory", path.display());
-            }
         }
         self.run.append_events(CONSOLE, &snap.console)?;
         self.run.append_events(NETWORK, &snap.network)?;
@@ -160,6 +205,16 @@ impl Executor {
     }
 }
 
+pub fn text_bytes(inline: Option<&str>, written: Option<&Path>) -> usize {
+    if let Some(text) = inline {
+        return text.len();
+    }
+    written
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len() as usize)
+        .unwrap_or_default()
+}
+
 pub fn snap_json(artifacts: &SnapArtifacts) -> serde_json::Value {
     serde_json::json!({
         "name": artifacts.name,
@@ -170,4 +225,30 @@ pub fn snap_json(artifacts: &SnapArtifacts) -> serde_json::Value {
         "console": artifacts.console,
         "network": artifacts.network,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_text_measures_the_response() {
+        assert_eq!(text_bytes(Some("hello"), None), 5);
+        assert_eq!(text_bytes(Some(""), None), 0);
+    }
+
+    #[test]
+    fn a_driver_that_only_writes_the_file_still_reports_bytes() {
+        let path = std::env::temp_dir().join("uibox-text-bytes-probe.txt");
+        std::fs::write(&path, "accessibility tree\n").unwrap();
+        assert_eq!(text_bytes(None, Some(&path)), 19);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn no_text_anywhere_is_zero() {
+        let missing = std::env::temp_dir().join("uibox-text-bytes-absent.txt");
+        assert_eq!(text_bytes(None, Some(&missing)), 0);
+        assert_eq!(text_bytes(None, None), 0);
+    }
 }

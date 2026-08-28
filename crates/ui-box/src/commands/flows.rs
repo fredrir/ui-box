@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::executor::{snap_json, Executor, SnapArtifacts};
-use super::{driver_options, ensure_surface, probe_backend, terminate};
+use super::{driver_options, driver_run_dir, ensure_surface, probe_backend, terminate};
 use crate::backend;
 use crate::cli::{RunArgs, VerifyArgs};
 use crate::config::{Config, Viewport};
@@ -94,6 +94,7 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
         .clone()
         .context("no flow: pass a step-format yaml file, e.g. `ui-box run flows/checkout.yaml`")?;
     let flow = Flow::load(&flow_path)?;
+    let mut skipped: Option<String> = None;
     let surface = args.surface.unwrap_or(flow.surface);
     let viewport = match args.viewport.as_ref().or(flow.viewport.as_ref()) {
         Some(raw) => Viewport::from_str(raw)?,
@@ -104,9 +105,17 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
     probe_backend(backend.as_ref())?;
 
     let placement = if args.no_place {
-        None
+        Placed::Skipped("--no-place was passed".to_string())
     } else {
         place_artifact(config, args)?
+    };
+    let placement = match placement {
+        Placed::Done(placed) => Some(placed),
+        Placed::Skipped(reason) => {
+            note!("not placing an artifact: {reason}");
+            skipped = Some(reason);
+            None
+        }
     };
     let target = effective_target(
         args.target.clone().unwrap_or_else(|| flow.target.clone()),
@@ -115,6 +124,8 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
 
     let spec = driver::resolve(surface, config)?;
     let run = RunDir::create(&config.artifacts)?;
+    let remote_run_dir = driver_run_dir(&spec, backend.as_ref(), &run)?;
+    let driver_dir = remote_run_dir.clone().unwrap_or_else(|| run.path.clone());
 
     let mut meta = Meta::new(&run.id, &backend.url(), surface);
     meta.project = args.project.clone().or_else(|| config.project.clone());
@@ -123,15 +134,7 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
     meta.target = Some(target.clone());
     meta.viewport = Some(viewport);
     if let Some(placed) = &placement {
-        meta.git_sha = placed.git_sha.clone().or(meta.git_sha);
-        meta.diff_hash = placed.diff_hash.clone();
-        meta.artifact_hash = placed.artifact_hash.clone();
-        meta.remote_path = Some(placed.remote_path.display().to_string());
-        meta.source = placed
-            .source
-            .as_ref()
-            .map(|tree| tree.display().to_string());
-        meta.cached = Some(placed.cached);
+        apply_placement(&mut meta, placed);
     }
     run.write_meta(&meta)?;
 
@@ -142,7 +145,11 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
     let prepared = (|| -> Result<String> {
         let info = conn.info()?;
         ensure_surface(&info, surface)?;
-        conn.open(&target, viewport, driver_options(config, surface, &run))
+        conn.open(
+            &target,
+            viewport,
+            driver_options(config, surface, &driver_dir),
+        )
     })();
     let driver_session = match prepared {
         Ok(session) => session,
@@ -156,6 +163,9 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
     };
 
     let mut executor = Executor::new(conn, run, driver_session, 0);
+    if remote_run_dir.is_some() {
+        executor = executor.pulling_from(backend::select(config)?);
+    }
     let mut snaps: Vec<SnapArtifacts> = Vec::new();
     let mut halted: Option<String> = None;
     let mut failure: Option<anyhow::Error> = None;
@@ -258,6 +268,7 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
             "remote_path": placed.remote_path,
             "cached": placed.cached,
         })),
+        "placement_skipped": skipped,
         "snaps": snaps.iter().map(snap_json).collect::<Vec<Value>>(),
         "goldens": goldens.as_ref().map(golden_json),
     });
@@ -271,10 +282,21 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
     Ok(Outcome { body, passed })
 }
 
-fn place_artifact(config: &Config, args: &RunArgs) -> Result<Option<Placement>> {
-    let Some(artifact) = args.artifact.clone() else {
-        note!("no --artifact: replaying against the target as it stands");
-        return Ok(None);
+enum Placed {
+    Done(Placement),
+    Skipped(String),
+}
+
+fn place_artifact(config: &Config, args: &RunArgs) -> Result<Placed> {
+    let artifact = args
+        .artifact
+        .clone()
+        .or_else(|| config.artifact.clone().map(PathBuf::from));
+    let Some(artifact) = artifact else {
+        return Ok(Placed::Skipped(
+            "no artifact: pass --artifact, set artifact in uibox.toml, or pass --no-place"
+                .to_string(),
+        ));
     };
     let project = args
         .project
@@ -316,7 +338,7 @@ fn place_artifact(config: &Config, args: &RunArgs) -> Result<Option<Placement>> 
         lab,
         target,
         source,
-        build: args.build.clone(),
+        build: args.build.clone().or_else(|| config.build.clone()),
         artifact,
     };
     let placed = pipeline::place(&request, build_backend.as_ref())?;
@@ -328,7 +350,7 @@ fn place_artifact(config: &Config, args: &RunArgs) -> Result<Option<Placement>> 
     } else {
         note!("placed artifact at {}", placed.remote_path.display());
     }
-    Ok(Some(placed))
+    Ok(Placed::Done(placed))
 }
 
 fn resolve_source(
@@ -378,6 +400,80 @@ fn resolve_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Surface;
+
+    fn placed() -> Placement {
+        Placement {
+            remote_path: PathBuf::from("/nix/store/aaa-app/bin/app"),
+            source: Some(PathBuf::from("/Users/fredrir/projects/thing")),
+            git_sha: Some("c0803e6".to_string()),
+            diff_hash: Some("d1ff".to_string()),
+            artifact_hash: Some("a271".to_string()),
+            cached: true,
+        }
+    }
+
+    #[test]
+    fn provenance_lands_in_the_right_meta_fields() {
+        let mut meta = Meta::new(
+            "20260828T000000Z-abcdef01",
+            "ssh://fredrir@dlab-ui",
+            Surface::Web,
+        );
+        apply_placement(&mut meta, &placed());
+        assert_eq!(meta.git_sha.as_deref(), Some("c0803e6"));
+        assert_eq!(meta.diff_hash.as_deref(), Some("d1ff"));
+        assert_eq!(meta.artifact_hash.as_deref(), Some("a271"));
+        assert_eq!(
+            meta.remote_path.as_deref(),
+            Some("/nix/store/aaa-app/bin/app")
+        );
+        assert_eq!(
+            meta.source.as_deref(),
+            Some("/Users/fredrir/projects/thing")
+        );
+        assert_eq!(meta.cached, Some(true));
+    }
+
+    #[test]
+    fn a_pipeline_without_a_sha_leaves_the_local_one() {
+        let mut meta = Meta::new("20260828T000000Z-abcdef01", "local://", Surface::Web);
+        meta.git_sha = Some("local-head".to_string());
+        let mut placement = placed();
+        placement.git_sha = None;
+        apply_placement(&mut meta, &placement);
+        assert_eq!(meta.git_sha.as_deref(), Some("local-head"));
+    }
+
+    #[test]
+    fn the_artifact_token_is_substituted() {
+        let placement = placed();
+        assert_eq!(
+            effective_target("exec:{{artifact}}".to_string(), Some(&placement)),
+            "exec:/nix/store/aaa-app/bin/app"
+        );
+        assert_eq!(
+            effective_target("exec:".to_string(), Some(&placement)),
+            "exec:/nix/store/aaa-app/bin/app"
+        );
+    }
+
+    #[test]
+    fn a_url_target_survives_placement_untouched() {
+        let placement = placed();
+        assert_eq!(
+            effective_target("http://dlab-ui:3000".to_string(), Some(&placement)),
+            "http://dlab-ui:3000"
+        );
+    }
+
+    #[test]
+    fn without_placement_the_target_is_verbatim() {
+        assert_eq!(
+            effective_target("exec:{{artifact}}".to_string(), None),
+            "exec:{{artifact}}"
+        );
+    }
 
     #[test]
     fn lab_checkout_syncs_nothing() {
@@ -422,6 +518,18 @@ fn git_toplevel() -> Option<PathBuf> {
     let root = git(&["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(root.trim());
     root.is_dir().then_some(root)
+}
+
+fn apply_placement(meta: &mut Meta, placed: &Placement) {
+    meta.git_sha = placed.git_sha.clone().or_else(|| meta.git_sha.clone());
+    meta.diff_hash = placed.diff_hash.clone();
+    meta.artifact_hash = placed.artifact_hash.clone();
+    meta.remote_path = Some(placed.remote_path.display().to_string());
+    meta.source = placed
+        .source
+        .as_ref()
+        .map(|tree| tree.display().to_string());
+    meta.cached = Some(placed.cached);
 }
 
 fn effective_target(target: String, placement: Option<&Placement>) -> String {

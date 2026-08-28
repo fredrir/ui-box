@@ -18,7 +18,7 @@ use crate::outcome::{Domain, Report, BLANK_BANNER};
 use crate::schema;
 use crate::uibox::{Invocation, Landing, UiBox};
 
-const BLOCKING_CHECKS: &[&str] = &["config", "artifacts", "backend", "driver.dom", "sessions"];
+const MAX_DIFF_IMAGES: usize = 3;
 
 #[derive(Default)]
 struct Memory {
@@ -96,7 +96,7 @@ impl UiBoxServer {
 
     async fn fresh_events(&self, id: &str, cwd: Option<&Path>, from_start: bool) -> Events {
         let Some(dir) = self.run_dir(id, cwd).await else {
-            return Events::default();
+            return diagnostics::unreadable();
         };
         let from = if from_start {
             Cursor::default()
@@ -135,11 +135,14 @@ impl UiBoxServer {
         }
 
         let wants_text = request.mode != "png";
+        let reported_bytes = snap.get("text_bytes").and_then(Value::as_u64);
         let blank = wants_text
-            && text
-                .as_deref()
-                .map(|body| body.trim().is_empty())
-                .unwrap_or(true);
+            && match (text.as_deref(), reported_bytes) {
+                (Some(body), _) => body.trim().is_empty(),
+                (None, Some(0)) => text_path.is_some(),
+                (None, _) => false,
+            };
+        let unreadable = wants_text && text.is_none() && !blank;
 
         let mut png = None;
         let mut png_note = None;
@@ -168,6 +171,8 @@ impl UiBoxServer {
             png,
             png_note,
             blank,
+            unreadable,
+            reported_bytes,
             events,
         }
     }
@@ -240,14 +245,19 @@ impl UiBoxServer {
             let line = format!("{name}: {detail}");
             if ok {
                 passing.push(line);
-            } else if BLOCKING_CHECKS.contains(&name) {
-                blocking.push(line);
-            } else {
+            } else if check.get("severity").and_then(Value::as_str) == Some("advisory") {
                 advisory.push(line);
+            } else {
+                blocking.push(line);
             }
         }
 
         report.fact("checks", Value::Array(checks.clone()));
+        facts_pick(
+            &mut report,
+            &checked.summary(),
+            &["blocking_failed", "advisory_failed"],
+        );
         report.block("ready", passing.join("\n"));
         if !advisory.is_empty() {
             report.block(
@@ -256,14 +266,26 @@ impl UiBoxServer {
             );
         }
 
-        if blocking.is_empty() {
+        if checked.landing.passed() && blocking.is_empty() {
             report
                 .line("Ready. Open a session with ui_open, then drive it with ui_act and ui_snap.");
-        } else {
+            return report.build();
+        }
+
+        if !blocking.is_empty() {
             report.block("blocking", blocking.join("\n"));
-            report.failed(
-                Domain::Tooling,
-                format!(
+        }
+        if let Some(code) = checked.landing.exit_code() {
+            report.fact("exit_code", code);
+        }
+        report.failed(
+            Domain::Tooling,
+            match blocking.is_empty() {
+                true => checked
+                    .landing
+                    .tooling_reason()
+                    .unwrap_or_else(|| "doctor did not report a usable lab".to_string()),
+                false => format!(
                     "ui-box cannot drive a UI yet: {}",
                     blocking
                         .iter()
@@ -271,10 +293,10 @@ impl UiBoxServer {
                         .collect::<Vec<&str>>()
                         .join(", ")
                 ),
-            );
-            if let Some(stderr) = checked.stderr_verbatim() {
-                report.block("ui-box stderr, verbatim", stderr);
-            }
+            },
+        );
+        if let Some(stderr) = checked.stderr_verbatim() {
+            report.block("ui-box stderr, verbatim", stderr);
         }
         report.build()
     }
@@ -665,6 +687,189 @@ impl UiBoxServer {
         report.build()
     }
 
+    async fn verify(&self, args: VerifyArgs) -> CallToolResult {
+        let cwd = args.project_dir.as_deref();
+        let mut argv = vec!["verify".to_string()];
+        push_option(&mut argv, "--since", args.since.as_deref());
+        push_option(&mut argv, "--flows", args.flows.as_deref());
+        push_option(&mut argv, "--golden-prefix", args.golden_prefix.as_deref());
+        push_option(&mut argv, "--lab", args.lab.as_deref());
+        push_option(&mut argv, "--project", args.project.as_deref());
+        push_option(&mut argv, "--build", args.build.as_deref());
+        push_option(&mut argv, "--artifact", args.artifact.as_deref());
+        push_option(&mut argv, "--source", args.source.as_deref());
+        push_option(&mut argv, "--target-lab", args.target_lab.as_deref());
+        if args.update_goldens {
+            argv.push("--update-goldens".to_string());
+        }
+        if args.lab_checkout {
+            argv.push("--lab-checkout".to_string());
+        }
+        if args.no_place {
+            argv.push("--no-place".to_string());
+        }
+        if args.keep_going {
+            argv.push("--keep-going".to_string());
+        }
+        if args.force {
+            argv.push("--force".to_string());
+        }
+
+        let invocation = self.uibox.call(argv, cwd).await;
+        let summary = invocation.summary();
+
+        let mut report = Report::new(String::new());
+        facts_pick(
+            &mut report,
+            &summary,
+            &[
+                "since",
+                "flows",
+                "failed",
+                "verdict",
+                "skipped",
+                "reason",
+                "looked_in",
+            ],
+        );
+
+        if summary.get("skipped").and_then(Value::as_bool) == Some(true) {
+            report.absorb(&invocation);
+            let reason = summary
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("verify replayed no flow")
+                .to_string();
+            report.headline("verify ran no flow, so no UI was exercised.");
+            if let Some(dir) = summary.get("looked_in").and_then(Value::as_str) {
+                report.line(format!(
+                    "It looked for flow files in {dir} and found none. Record one with \
+                     ui_record and commit it, then this gate has something to check."
+                ));
+            }
+            if let Some(since) = summary.get("since").and_then(Value::as_str) {
+                report.line(format!(
+                    "The tree has not moved since {since}. Verify again without `since` \
+                     to replay the flows regardless."
+                ));
+            }
+            report.inconclusive(reason);
+            return report.build();
+        }
+
+        let flows = summary.get("flows").and_then(Value::as_u64).unwrap_or(0);
+        let failed = summary.get("failed").and_then(Value::as_u64).unwrap_or(0);
+        let verdict = invocation
+            .text("verdict")
+            .unwrap_or_else(|| "unknown".to_string());
+
+        report.headline(match invocation.text("verdict") {
+            Some(_) => format!("verified {flows} flow(s): verdict {verdict}, {failed} failed."),
+            None => "verify did not reach a verdict.".to_string(),
+        });
+
+        let results = summary
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut lines = Vec::new();
+        let mut notes = Vec::new();
+        let mut diffs = Vec::new();
+        let mut moved = Vec::new();
+        for result in &results {
+            let flow = result.get("flow").and_then(Value::as_str).unwrap_or("?");
+            let outcome = result.get("verdict").and_then(Value::as_str).unwrap_or("?");
+            let steps_failed = result
+                .get("steps_failed")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let steps_total = result
+                .get("steps_total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            lines.push(format!(
+                "{outcome:<5} {flow}  {steps_failed}/{steps_total} steps failed"
+            ));
+            if let Some(halted) = result.get("halted_at").and_then(Value::as_str) {
+                lines.push(format!("      halted at {halted}"));
+            }
+            let Some(entries) = result
+                .get("goldens")
+                .and_then(|goldens| goldens.get("entries"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for entry in entries {
+                let name = entry.get("name").and_then(Value::as_str).unwrap_or("?");
+                match entry.get("state").and_then(Value::as_str) {
+                    Some("differs") => {
+                        let pixels = entry.get("pixels").and_then(Value::as_u64).unwrap_or(0);
+                        let ratio = entry.get("ratio").and_then(Value::as_f64).unwrap_or(0.0);
+                        let mismatch = entry
+                            .get("size_mismatch")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        notes.push(format!(
+                            "{name}: {pixels} pixels differ ({:.4} of the frame){}",
+                            ratio,
+                            if mismatch {
+                                ", and the size changed"
+                            } else {
+                                ""
+                            }
+                        ));
+                        moved.push(name.to_string());
+                        if let Some(diff) = entry.get("diff").and_then(Value::as_str) {
+                            notes.push(format!("      diff image {diff}"));
+                            diffs.push(PathBuf::from(diff));
+                        }
+                    }
+                    Some("new") => {
+                        notes.push(format!("{name}: no golden yet, nothing to compare against"))
+                    }
+                    Some("approved") => notes.push(format!("{name}: approved as the new golden")),
+                    _ => {}
+                }
+            }
+        }
+
+        report.block("flows", lines.join("\n"));
+        report.block("goldens", notes.join("\n"));
+
+        if invocation.landing.is_step_failure() && !moved.is_empty() {
+            report.failed(
+                Domain::UnderTest,
+                format!(
+                    "{} golden(s) no longer match what the UI renders: {}",
+                    moved.len(),
+                    moved.join(", ")
+                ),
+            );
+        }
+        report.absorb(&invocation);
+
+        for path in diffs.iter().take(MAX_DIFF_IMAGES) {
+            match diagnostics::snapshot_png(path).await {
+                Ok(bytes) => {
+                    report.image(bytes);
+                }
+                Err(reason) => {
+                    report.line(format!("Diff image not inlined: {reason}"));
+                }
+            }
+        }
+        if diffs.len() > MAX_DIFF_IMAGES {
+            report.line(format!(
+                "{} further diff images are on disk but not inlined.",
+                diffs.len() - MAX_DIFF_IMAGES
+            ));
+        }
+        report.build()
+    }
+
     async fn runs(&self, args: RunsArgs) -> CallToolResult {
         let cwd = args.project_dir.as_deref();
         let mut argv = vec!["runs".to_string()];
@@ -772,6 +977,7 @@ impl UiBoxServer {
             schema::CLOSE => parsed!(close),
             schema::RECORD => parsed!(record),
             schema::RUN => parsed!(run),
+            schema::VERIFY => parsed!(verify),
             schema::RUNS => parsed!(runs),
             schema::SHOW => parsed!(show),
             other => Report::invalid(format!("no tool named {other:?} on this server")),
@@ -836,6 +1042,8 @@ struct Capture {
     png: Option<Vec<u8>>,
     png_note: Option<String>,
     blank: bool,
+    unreadable: bool,
+    reported_bytes: Option<u64>,
     events: Events,
 }
 
@@ -868,6 +1076,25 @@ fn merge_capture(report: &mut Report, capture: &Capture, title: &str) {
                 "the accessibility snapshot is empty, so the page rendered nothing",
             );
         }
+        _ if capture.unreadable => {
+            let where_ = match &capture.text_path {
+                Some(path) => format!(" at {}", path.display()),
+                None => String::new(),
+            };
+            report.line(match capture.reported_bytes {
+                Some(bytes) if bytes > 0 => format!(
+                    "The snapshot text could not be read{where_}, so it is not shown here. \
+                     This is NOT a blank page: ui-box reported {bytes} bytes of accessibility \
+                     text, so the page did render. Read the file directly to see it."
+                ),
+                _ => format!(
+                    "No snapshot text came back{where_}, and ui-box reported none either, so \
+                     nothing is known about what the page rendered. Do not read this as either \
+                     a blank page or a healthy one: the driver delivered no accessibility text \
+                     to judge it by."
+                ),
+            });
+        }
         _ => {}
     }
 
@@ -886,6 +1113,14 @@ fn merge_capture(report: &mut Report, capture: &Capture, title: &str) {
 }
 
 fn merge_events(report: &mut Report, events: &Events) {
+    if !events.readable {
+        report.line(
+            "Console output and network activity could not be read: this run's directory is \
+             not readable from here. The absence of errors below is not evidence that there \
+             were none.",
+        );
+        return;
+    }
     for (title, body) in events.render() {
         report.block(&title, body);
     }
@@ -1060,6 +1295,26 @@ struct RunArgs {
     force: bool,
     include_image: bool,
     max_chars: Option<usize>,
+    project_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct VerifyArgs {
+    since: Option<String>,
+    flows: Option<String>,
+    update_goldens: bool,
+    golden_prefix: Option<String>,
+    lab: Option<String>,
+    project: Option<String>,
+    build: Option<String>,
+    artifact: Option<String>,
+    source: Option<String>,
+    lab_checkout: bool,
+    target_lab: Option<String>,
+    no_place: bool,
+    keep_going: bool,
+    force: bool,
     project_dir: Option<PathBuf>,
 }
 

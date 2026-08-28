@@ -151,8 +151,18 @@ only for speed: it is what keeps `target/` and `node_modules/` out of the copy,
 which is the same cost that makes `path:.` expensive.
 
 Provenance is computed from the LOCAL tree before the sync, never from the
-staged copy. The local worktree is the thing under test, and a hash taken after
-an rsync would describe the transport rather than the source.
+staged copy. This is load-bearing, not stylistic, and was probed against a real
+lab: a staged subdirectory carries no `.git`, so in-lab provenance would fail
+outright with "not a git repository" for every subdirectory source -- and for a
+repo-root source it would do something worse, silently hashing the staged copy
+and describing the transport rather than the worktree the user edited.
+
+Provenance scoping is partial by design. `diff_hash` is scoped to the synced
+tree (`git diff HEAD -- .` plus untracked files under `source`), so a change
+outside it does not invalidate. `git_sha` stays repo-wide: a commit anywhere
+moves HEAD and still over-invalidates. That is wasteful, not wrong -- it errs
+toward rebuilding. Scoping the sha would need `git log -1 -- .` and is not
+worth the complexity.
 
 The `&dyn Backend` handed to `place()` is the BUILD environment -- the one
 holding `req.lab`'s checkout, where the build command runs. It is NOT the
@@ -228,3 +238,38 @@ on them:
 A hook must never read 2 as a test failure. `wake` is fire-and-forget: it
 returns 0 as soon as the lab is reachable or the wake is in flight, and it
 never fails a caller.
+
+## 8. Absence read as success
+
+The recurring bug in a verification tool is not a wrong answer. It is a
+confident answer about nothing. Found three times independently, in three
+components:
+
+    a snapshot of a blank page          reads as "the UI rendered"
+    `verify` with no flows or no diff   reads as "the UI is correct"
+    `wait_for` against an empty page    reads as "the element arrived"
+
+Each is an ABSENCE of evidence presented in the shape of POSITIVE evidence.
+The exit code is 0, nothing errored, and nothing was proven.
+
+The rule: a component that can produce "nothing happened" must encode it as
+its own outcome, distinct from both success and failure. Not an error -- the
+tree genuinely may not have moved, and a tool that cries wolf on a normal path
+gets ignored exactly when it matters -- but never silently a pass. The MCP
+server's `nothing_verified` (`ok: false`, `isError: false`) is the reference
+shape.
+
+Found four times, in two directions -- a blank snapshot and a `verify` skip
+read absence as SUCCESS; an unreadable snapshot and an unreadable run directory
+read it as a definite ANSWER (a UI failure, and a clean bill of health). The
+direction is not the bug. Inferring anything at all from missing evidence is.
+
+The resolution rule, which has held in every case: PREFER FACTS THAT CAME OVER
+THE WIRE to your own filesystem access. A value ui-box reported survives a
+transport problem; a file read does not. `text_bytes` guards the snapshot path,
+`readable` guards diagnostics. Where neither is available, say you do not know
+rather than picking a side.
+
+When adding any check, ask what its answer is when there is nothing to check.
+If that answer is indistinguishable from success -- or from any definite
+answer -- it is this bug again.

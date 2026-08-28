@@ -4,6 +4,7 @@ pub mod flows;
 pub mod live;
 pub mod records;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -13,7 +14,8 @@ use crate::backend::{Backend, Cmd};
 use crate::cli::{Cli, Command};
 use crate::config::{Config, Surface};
 use crate::driver::client::process_alive;
-use crate::driver::DriverInfo;
+use crate::driver::{DriverInfo, DriverSpec};
+use crate::note;
 use crate::output::Summary;
 use crate::run::RunDir;
 
@@ -61,15 +63,39 @@ pub fn ensure_surface(info: &DriverInfo, surface: Surface) -> Result<()> {
     );
 }
 
-pub fn driver_options(config: &Config, surface: Surface, run: &RunDir) -> Value {
+pub fn driver_options(config: &Config, surface: Surface, run_dir: &Path) -> Value {
     json!({
         "surface": surface.as_str(),
         "display": config.display,
         "force": config.force,
-        "runDir": run.path,
-        "snapsDir": run.snaps_dir(),
-        "artifactsDir": config.artifacts,
+        "runDir": run_dir,
+        "snapsDir": run_dir.join("snaps"),
+        "artifactsDir": run_dir.parent(),
     })
+}
+
+pub fn driver_run_dir(
+    spec: &DriverSpec,
+    backend: &dyn Backend,
+    run: &RunDir,
+) -> Result<Option<PathBuf>> {
+    if !spec.remote {
+        return Ok(None);
+    }
+    let script = format!(
+        "d=\"$HOME/.uibox/runs/{}\"; mkdir -p \"$d/snaps\" \"$d/diff\" && printf %s \"$d\"",
+        run.id
+    );
+    let output = backend.require(&Cmd::shell(script))?;
+    let dir = output.trimmed_stdout();
+    if dir.is_empty() {
+        bail!(
+            "{} did not report a run directory for the driver",
+            backend.url()
+        );
+    }
+    note!("driver writes to {dir} on {}", backend.url());
+    Ok(Some(PathBuf::from(dir)))
 }
 
 pub fn terminate(pid: u32) {

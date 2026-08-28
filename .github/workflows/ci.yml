@@ -1,0 +1,140 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust-lint:
+    name: rust lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  rust-test:
+    name: rust test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - run: cargo nextest run --workspace --locked --status-level fail
+
+  node:
+    name: dom driver
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: drivers/dom
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: drivers/dom/package-lock.json
+
+      - run: npm ci
+
+      # playwright-core never downloads on npm install, so the browser is fetched
+      # explicitly and cached against the pinned playwright-core version.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('drivers/dom/package-lock.json') }}
+
+      - run: npx playwright-core install chromium
+
+      - run: npm run build
+
+      - run: npm run lint
+
+      - run: npm test
+
+  python:
+    name: vision
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: tools/vision
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.7"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: tools/vision/uv.lock
+
+      - run: uv sync --locked
+
+      - run: uv run --no-sync pytest -q
+
+  flake:
+    name: nix flake
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v17
+
+      # Evaluation only. Building the packages here would cost far more than the
+      # whole rest of CI; the release workflow is where they get built.
+      - run: nix flake check --all-systems --no-build --no-write-lock-file
+
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [rust-lint, rust-test, node, python, flake]
+    steps:
+      - name: verdict
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          case "$RESULTS" in
+            ""|*failure*|*cancelled*|*skipped*) exit 1 ;;
+          esac

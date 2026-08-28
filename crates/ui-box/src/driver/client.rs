@@ -183,6 +183,10 @@ impl Connection {
         })
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }

@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use super::executor::{snap_json, Executor};
-use super::{driver_options, ensure_surface, probe_backend, terminate};
+use super::{driver_options, driver_run_dir, ensure_surface, probe_backend, terminate};
 use crate::backend;
 use crate::cli::{ActArgs, CloseArgs, EvalArgs, OpenArgs, SnapArgs, WakeArgs};
 use crate::config::{Config, Viewport};
@@ -33,6 +33,8 @@ pub fn open(config: &Config, args: &OpenArgs) -> Result<Summary> {
 
     let spec = driver::resolve(surface, config)?;
     let run = RunDir::create(&config.artifacts)?;
+    let remote_run_dir = driver_run_dir(&spec, backend.as_ref(), &run)?;
+    let driver_dir = remote_run_dir.clone().unwrap_or_else(|| run.path.clone());
     let store = SessionStore::new(config);
     let session_dir = store.create_dir(&run.id)?;
 
@@ -42,7 +44,11 @@ pub fn open(config: &Config, args: &OpenArgs) -> Result<Summary> {
     let opened = (|| -> Result<(driver::DriverInfo, String)> {
         let info = conn.info()?;
         ensure_surface(&info, surface)?;
-        let session = conn.open(&target, viewport, driver_options(config, surface, &run))?;
+        let session = conn.open(
+            &target,
+            viewport,
+            driver_options(config, surface, &driver_dir),
+        )?;
         Ok((info, session))
     })();
 
@@ -59,7 +65,7 @@ pub fn open(config: &Config, args: &OpenArgs) -> Result<Summary> {
     let record = SessionRecord {
         id: run.id.clone(),
         driver_session: driver_session.clone(),
-        driver_name: info.name.clone(),
+        driver_name: spec.name.clone(),
         driver_argv: spec.argv.clone(),
         pid,
         surface,
@@ -67,6 +73,7 @@ pub fn open(config: &Config, args: &OpenArgs) -> Result<Summary> {
         viewport,
         backend: backend.url(),
         run_dir: run.path.clone(),
+        remote_run_dir,
         session_dir,
         created_unix: now,
         last_used_unix: now,
@@ -109,6 +116,9 @@ pub fn act(config: &Config, args: &ActArgs) -> Result<Summary> {
 
     let step = build_step(args)?;
     let mut executor = Executor::new(conn, run, record.driver_session.clone(), record.step_count);
+    if record.remote_run_dir.is_some() {
+        executor = executor.pulling_from(backend::select(config)?);
+    }
     let outcome = executor.perform(&step);
 
     record.step_count = executor.total;
@@ -156,6 +166,9 @@ pub fn snap(config: &Config, args: &SnapArgs) -> Result<Summary> {
         mode: Some(args.mode),
     });
     let mut executor = Executor::new(conn, run, record.driver_session.clone(), record.step_count);
+    if record.remote_run_dir.is_some() {
+        executor = executor.pulling_from(backend::select(config)?);
+    }
     let outcome = executor.perform(&step);
 
     record.step_count = executor.total;

@@ -12,6 +12,7 @@ pub const EVAL: &str = "ui_eval";
 pub const CLOSE: &str = "ui_close";
 pub const RECORD: &str = "ui_record";
 pub const RUN: &str = "ui_run";
+pub const VERIFY: &str = "ui_verify";
 pub const RUNS: &str = "ui_runs";
 pub const SHOW: &str = "ui_show";
 
@@ -23,6 +24,10 @@ UI does not.
 Normal loop: call ui_test_prepare first, then ui_open to get a session, then ui_act /
 ui_snap / ui_eval against that session, then ui_close. Freeze a session you like into a
 committed flow file with ui_record, and replay it later with ui_run.
+
+ui_verify runs the same gate the Stop hook runs, so you can fix a regression yourself
+instead of meeting it as a wall at the end of a turn. Read its result carefully: verify
+exits 0 both when every flow passed and when it ran nothing at all.
 
 Snapshots are accessibility trees as text, and that is what you should read. Screenshots
 are returned only when you ask for them or when something fails, because images cost far
@@ -69,10 +74,10 @@ pub fn tools() -> Vec<Tool> {
             PREPARE,
             "Wake the lab that hosts the UI and check that ui-box can actually drive it. \
              Call this once before the first ui_open in a session of work. It returns ready, \
-             or the specific reason it is not ready. Checks that only matter for `ui_run` \
-             golden comparison (vision, goldens) are reported as advisory and do not block \
-             the live loop. Artifact placement itself happens in ui_run, which builds and \
-             copies the artifact into the lab as part of a replay.",
+             or the specific reason it is not ready. Checks ui-box marks advisory, such as the \
+             golden store, are reported but do not block the live loop. Artifact placement \
+             itself happens in ui_run, which builds and copies the artifact into the lab as \
+             part of a replay.",
             json!({
                 "type": "object",
                 "properties": {
@@ -241,6 +246,40 @@ pub fn tools() -> Vec<Tool> {
                     "force": { "type": "boolean", "description": "Set DLAB_FORCE=1 on the ssh backend." },
                     "include_image": { "type": "boolean", "description": "Return the last screenshot the flow took as an image block." },
                     "max_chars": { "type": "integer", "minimum": 200, "description": "Cap on inlined snapshot text. Default 20000." },
+                    "project_dir": project_dir()
+                },
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
+            VERIFY,
+            "Replay every committed flow and compare its screenshots against the approved \
+             goldens. This is the same gate the Stop hook runs, so running it yourself lets you \
+             fix a visual regression before it blocks you.\n\n\
+             READ THE RESULT, NOT JUST THE EXIT: verify is quiet when there is nothing to do. \
+             It skips when --since says the tree has not moved, and when no flow files exist. \
+             In those cases it still succeeds while having exercised no UI at all, and the \
+             result comes back with status `nothing_verified` rather than `passed`. A \
+             `nothing_verified` result proves nothing about your UI; it means no work was \
+             done. Only `passed` means flows actually ran and matched their goldens.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "since": { "type": "string", "description": "Git ref. Verify only if the tree moved since it, otherwise skip. Skipping returns nothing_verified, not a pass." },
+                    "flows": { "type": "string", "description": "Directory holding the flow files. Defaults to flows/." },
+                    "update_goldens": { "type": "boolean", "description": "Approve every candidate screenshot as the new golden. This REWRITES the golden store and makes the comparison pass by definition, so only do it when you have looked at the differences and decided the new rendering is correct." },
+                    "golden_prefix": { "type": "string", "description": "Golden name prefix. Defaults to project/flow." },
+                    "lab": { "type": "string", "description": "Build lab holding the checkout under test." },
+                    "project": { "type": "string" },
+                    "build": { "type": "string", "description": "Build command to run in the build lab." },
+                    "artifact": { "type": "string", "description": "Artifact to place into the target lab before replaying." },
+                    "source": { "type": "string", "description": "Local tree synced into the build lab. Defaults to the project root." },
+                    "lab_checkout": { "type": "boolean", "description": "Build from the lab's own checkout instead of syncing a local tree." },
+                    "target_lab": { "type": "string", "description": "Lab the artifact is placed into." },
+                    "no_place": { "type": "boolean", "description": "Skip the pipeline and replay against the target as it stands." },
+                    "keep_going": { "type": "boolean", "description": "Keep running after a failing step instead of halting." },
+                    "force": { "type": "boolean", "description": "Set DLAB_FORCE=1 on the ssh backend." },
                     "project_dir": project_dir()
                 },
                 "additionalProperties": false
