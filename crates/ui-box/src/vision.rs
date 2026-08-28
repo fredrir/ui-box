@@ -86,8 +86,11 @@ impl Vision {
     }
 
     fn invoke(&self, args: &[String]) -> Result<Value> {
-        let mut command = Command::new(&self.argv[0]);
-        command.args(&self.argv[1..]).args(args);
+        let Some((program, leading)) = self.argv.split_first() else {
+            bail!("{PROGRAM} was located with no command to run");
+        };
+        let mut command = Command::new(program);
+        command.args(leading).args(args);
         let output = command
             .output()
             .with_context(|| format!("cannot run `{} {}`", self.display(), args.join(" ")))?;

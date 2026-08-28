@@ -189,8 +189,11 @@ fn check_driver(config: &Config, surface: Surface) -> Check {
         Ok(spec) => spec,
         Err(err) => return Check::fail("driver.dom", err.to_string()),
     };
-    if which(&spec.argv[0]).is_none() && !std::path::Path::new(&spec.argv[0]).is_file() {
-        return Check::fail("driver.dom", format!("{} is not executable", spec.argv[0]));
+    let Some(program) = spec.argv.first() else {
+        return Check::fail("driver.dom", format!("{} has no command to run", spec.name));
+    };
+    if which(program).is_none() && !std::path::Path::new(program).is_file() {
+        return Check::fail("driver.dom", format!("{program} is not executable"));
     }
     let mut conn = match Connection::spawn(&spec, config.rpc_timeout) {
         Ok(conn) => conn,

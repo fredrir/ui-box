@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -91,7 +91,7 @@ pub struct Connection {
 
 impl Connection {
     pub fn spawn(spec: &DriverSpec, timeout: Duration) -> Result<Connection> {
-        let mut child = command_for(spec)
+        let mut child = command_for(spec)?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -134,7 +134,7 @@ impl Connection {
         let child_stderr =
             File::create(&log).with_context(|| format!("cannot create {}", log.display()))?;
 
-        let child = command_for(spec)
+        let child = command_for(spec)?
             .stdin(Stdio::from(child_stdin))
             .stdout(Stdio::from(child_stdout))
             .stderr(Stdio::from(child_stderr))
@@ -354,10 +354,13 @@ impl Connection {
     }
 }
 
-fn command_for(spec: &DriverSpec) -> Command {
-    let mut command = Command::new(&spec.argv[0]);
-    command.args(&spec.argv[1..]);
-    command
+fn command_for(spec: &DriverSpec) -> Result<Command> {
+    let Some((program, args)) = spec.argv.split_first() else {
+        bail!("driver {} has no command to run", spec.name);
+    };
+    let mut command = Command::new(program);
+    command.args(args);
+    Ok(command)
 }
 
 fn reader_thread(source: Box<dyn Read + Send>, name: String) -> Receiver<Value> {
