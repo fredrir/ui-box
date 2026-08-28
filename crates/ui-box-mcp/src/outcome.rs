@@ -5,13 +5,13 @@ use serde_json::{Map, Value};
 use crate::uibox::{Invocation, Landing};
 
 pub const TOOLING_BANNER: &str = "\
-UI-BOX COULD NOT RUN (exit 2) -- INFRASTRUCTURE FAILURE, NOT A UI BUG.
+UI-BOX COULD NOT RUN -- INFRASTRUCTURE FAILURE, NOT A UI BUG.
 The UI under test was never exercised, so this result says nothing at all about whether
 the UI works. Do not go looking for an application bug: repair the tooling (backend
 reachability, driver, configuration) and call the tool again.";
 
 pub const TEST_BANNER: &str = "\
-UI TEST FAILED (exit 1) -- THE THING UNDER TEST FAILED.
+UI TEST FAILED -- THE THING UNDER TEST FAILED.
 ui-box itself ran correctly, so this is a real result about the UI. The tooling is fine;
 the failure is in the application or in the step that was asked of it.";
 

@@ -374,7 +374,10 @@ describe("dom driver", { timeout: 120_000 }, () => {
   test("protocol errors are reported without killing the process", async () => {
     client.writeRaw("this is not json\n");
     await assert.rejects(() => client.call("driver.teleport", {}), /unknown method/);
-    await assert.rejects(() => client.call("open", { target: "http://127.0.0.1:1" }), /unknown method: open/);
+    await assert.rejects(
+      () => client.call("open", { target: "http://127.0.0.1:1" }),
+      /unknown method: open/,
+    );
     const info = await client.call("driver.info");
     assert.equal(info.name, "dom");
   });

@@ -265,10 +265,21 @@ read it as a definite ANSWER (a UI failure, and a clean bill of health). The
 direction is not the bug. Inferring anything at all from missing evidence is.
 
 The resolution rule, which has held in every case: PREFER FACTS THAT CAME OVER
-THE WIRE to your own filesystem access. A value ui-box reported survives a
+THE WIRE to your own reading of the world. A value ui-box reported survives a
 transport problem; a file read does not. `text_bytes` guards the snapshot path,
-`readable` guards diagnostics. Where neither is available, say you do not know
-rather than picking a side.
+`readable` guards diagnostics, and `localise()` guarantees that a reported path
+is a file that exists. Where neither is available, say you do not know rather
+than picking a side.
+
+THE EXIT CODE IS ALSO A READING OF THE WORLD, and is only trustworthy when the
+contract defining it was honoured. §7 guarantees exactly one JSON line with an
+`ok` field on stdout, so an exit 1 with no parseable summary is not a verdict --
+it is a binary that crashed. Reported as a verdict it becomes the worst version
+of this bug: a broken tool announced to the agent as a broken application.
+For the same reason, never restate an exit code in prose ("UI TEST FAILED
+(exit 1)") -- a blank snapshot and a close with failed steps both exit 0.
+Precise-looking text that is sometimes false is worse than text that does not
+claim the detail.
 
 When adding any check, ask what its answer is when there is nothing to check.
 If that answer is indistinguishable from success -- or from any definite

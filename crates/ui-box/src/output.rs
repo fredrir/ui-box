@@ -96,8 +96,16 @@ impl Summary {
         serde_json::to_string(&ordered).unwrap_or_else(|_| r#"{"ok":false}"#.to_string())
     }
 
+    pub fn stream(&self) -> Stream {
+        if self.exit_code == EXIT_PASS {
+            self.stream
+        } else {
+            Stream::Stdout
+        }
+    }
+
     pub fn emit(&self) {
-        match self.stream {
+        match self.stream() {
             Stream::Stdout => println!("{}", self.render()),
             Stream::Stderr => {
                 let mut stderr = std::io::stderr().lock();
@@ -113,4 +121,44 @@ pub fn error_summary(kind: &str, message: &str, context: Option<&str>) -> String
         value["context"] = Value::String(context.to_string());
     }
     serde_json::to_string(&value).unwrap_or_else(|_| r#"{"ok":false}"#.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_failing_run_always_lands_on_stdout() {
+        let summary = Summary::failed(json!({ "verdict": "fail" })).on_stderr();
+        assert_eq!(summary.stream(), Stream::Stdout);
+        assert_eq!(summary.exit_code(), EXIT_FAIL);
+    }
+
+    #[test]
+    fn an_unusable_tool_always_lands_on_stdout() {
+        let summary = Summary::unusable(json!({})).on_stderr();
+        assert_eq!(summary.stream(), Stream::Stdout);
+        assert_eq!(summary.exit_code(), EXIT_TOOL);
+    }
+
+    #[test]
+    fn only_a_passing_summary_may_be_diverted() {
+        let summary = Summary::ok(json!({ "out": "-" })).on_stderr();
+        assert_eq!(summary.stream(), Stream::Stderr);
+        assert_eq!(summary.exit_code(), EXIT_PASS);
+    }
+
+    #[test]
+    fn every_summary_carries_an_ok_field() {
+        for summary in [
+            Summary::ok(json!({})),
+            Summary::failed(json!({})),
+            Summary::unusable(json!({})),
+        ] {
+            let rendered: serde_json::Value =
+                serde_json::from_str(&summary.render()).expect("summary is json");
+            assert!(rendered.get("ok").is_some(), "{}", summary.render());
+        }
+    }
 }
