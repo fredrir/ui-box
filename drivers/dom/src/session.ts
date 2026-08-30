@@ -250,6 +250,10 @@ export class Session {
       await this.assertText(plan);
       return undefined;
     }
+    if ("assert_absent" in plan.step) {
+      await this.assertAbsent(plan.step.assert_absent, plan.timeoutMs);
+      return undefined;
+    }
     const body = plan.step.snap;
     return this.captureSnap(body.mode, body.name);
   }
@@ -277,6 +281,31 @@ export class Session {
     );
   }
 
+  private async assertAbsent(raw: string, timeoutMs: number | null): Promise<void> {
+    const selector = parseSelector(raw);
+    const timeout = timeoutMs ?? DEFAULT_ASSERT_TIMEOUT_MS;
+    const deadline = Date.now() + Math.max(timeout, 0);
+    let count = await this.backend.countMatches(selector);
+    while (count > 0 && Date.now() < deadline) {
+      await delay(READINESS_POLL_MS);
+      count = await this.backend.countMatches(selector);
+    }
+    if (count > 0) {
+      throw await this.assertionFailure(
+        `"${raw}" is still present after ${timeout}ms; ${count} element(s) matched`,
+      );
+    }
+    const report = await this.backend.readiness();
+    if (!report.ready) {
+      throw new DriverError(
+        "nothing_verified",
+        `"${raw}" matched nothing, but the page is not rendered (${report.reason}), so its absence proves nothing`,
+        undefined,
+        { detail: `readyState=${report.readyState} textLength=${report.textLength}` },
+      );
+    }
+  }
+
   private async assertionFailure(message: string): Promise<DriverError> {
     const detail = await this.pageTextExcerpt();
     return new DriverError("assertion", message, undefined, detail ? { detail } : undefined);
@@ -295,7 +324,7 @@ export class Session {
   }
 
   private async captureSnap(mode: SnapMode, requestedName?: string): Promise<SnapResult> {
-    const wantsText = mode === "text" || mode === "both";
+    const wantsText = mode === "text" || mode === "both" || mode === "layout";
     const wantsPng = mode === "png" || mode === "both";
     if (wantsPng && !this.snaps.enabled) {
       throw new DriverError(
@@ -311,6 +340,7 @@ export class Session {
           maxLines: this.options.maxTreeLines ?? DEFAULT_MAX_TREE_LINES,
           maxTextLength: DEFAULT_MAX_TEXT_LENGTH,
           includeHidden: false,
+          layout: mode === "layout",
         })
       : undefined;
     const png = wantsPng ? await this.backend.screenshot() : undefined;

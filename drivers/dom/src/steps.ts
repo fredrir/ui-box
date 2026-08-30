@@ -21,6 +21,8 @@ const KEY_ALIASES: Record<string, StepKind> = {
   waitFor: "wait_for",
   assert_text: "assert_text",
   assertText: "assert_text",
+  assert_absent: "assert_absent",
+  assertAbsent: "assert_absent",
   snap: "snap",
   screenshot: "snap",
 };
@@ -87,6 +89,7 @@ function actionBody(kind: StepKind, record: Record<string, unknown>): unknown {
       return record.url ?? record.target ?? record.value;
     case "click":
     case "wait_for":
+    case "assert_absent":
       return record.selector ?? record.value;
     case "type":
       return {
@@ -121,6 +124,10 @@ function build(kind: StepKind, body: unknown, timeoutMs: number | null): StepPla
     case "wait_for": {
       const selector = asSelectorString(body, "wait_for");
       return { kind, step: { wait_for: selector }, timeoutMs, selector };
+    }
+    case "assert_absent": {
+      const selector = asSelectorString(body, "assert_absent");
+      return { kind, step: { assert_absent: selector }, timeoutMs, selector };
     }
     case "key": {
       const key = asString(body, "key");
@@ -177,10 +184,10 @@ function build(kind: StepKind, body: unknown, timeoutMs: number | null): StepPla
 
 function normalizeMode(raw: unknown): SnapMode {
   if (raw === undefined || raw === null) return "text";
-  if (raw === "text" || raw === "png" || raw === "both") return raw;
+  if (raw === "text" || raw === "png" || raw === "both" || raw === "layout") return raw;
   throw new DriverError(
     "step",
-    `invalid snap mode ${JSON.stringify(raw)}, expected text, png or both`,
+    `invalid snap mode ${JSON.stringify(raw)}, expected text, png, both or layout`,
     RPC_INVALID_PARAMS,
   );
 }
@@ -203,7 +210,7 @@ function asSelectorString(body: unknown, label: string): string {
 function unknownStep(key: string): DriverError {
   return new DriverError(
     "step",
-    `unknown step "${key}"; supported: open, click, type, key, wait_for, assert_text, snap`,
+    `unknown step "${key}"; supported: open, click, type, key, wait_for, assert_text, assert_absent, snap`,
     RPC_INVALID_PARAMS,
   );
 }

@@ -32,6 +32,7 @@ export class PlaywrightBackend implements Backend {
   private readonly context: BrowserContext;
   private readonly page: Page;
   private readonly recorder: EventRecorder;
+  private proxyCounter = 0;
 
   private constructor(
     browser: Browser,
@@ -132,7 +133,9 @@ export class PlaywrightBackend implements Backend {
   }
 
   async click(selector: ParsedSelector, timeoutMs: number): Promise<void> {
-    await this.locator(selector).click({ timeout: timeoutMs });
+    await this.actOnInteractionTarget(selector, timeoutMs, (target) =>
+      target.click({ timeout: timeoutMs }),
+    );
   }
 
   async fill(
@@ -156,7 +159,9 @@ export class PlaywrightBackend implements Backend {
   }
 
   async waitFor(selector: ParsedSelector, timeoutMs: number): Promise<void> {
-    await this.locator(selector).first().waitFor({ state: "visible", timeout: timeoutMs });
+    await this.actOnInteractionTarget(selector, timeoutMs, (target) =>
+      target.first().waitFor({ state: "visible", timeout: timeoutMs }),
+    );
   }
 
   async countMatches(selector: ParsedSelector): Promise<number> {
@@ -211,6 +216,31 @@ export class PlaywrightBackend implements Backend {
   async dispose(): Promise<void> {
     await this.context.close().catch(() => undefined);
     await this.browser.close().catch(() => undefined);
+  }
+
+  private async actOnInteractionTarget(
+    selector: ParsedSelector,
+    timeoutMs: number,
+    run: (target: Locator) => Promise<void>,
+  ): Promise<void> {
+    const locator = this.locator(selector);
+    const token = this.nextProxyToken();
+    const proxied = await locator
+      .evaluate((el, mark) => window.__uibox!.labelProxy(el, mark), token, { timeout: timeoutMs })
+      .catch(() => false);
+    if (!proxied) return run(locator);
+    try {
+      await run(this.page.locator(`[data-uibox-hit="${token}"]`));
+    } finally {
+      await this.page
+        .evaluate((mark) => window.__uibox!.clearMarks(mark), token)
+        .catch(() => undefined);
+    }
+  }
+
+  private nextProxyToken(): string {
+    this.proxyCounter += 1;
+    return `uibox-proxy-${this.proxyCounter}`;
   }
 
   private async ensureRuntime(): Promise<void> {

@@ -12,12 +12,21 @@ export interface FakeWebDriver {
   url: string;
   requests: RecordedRequest[];
   scripts: string[];
+  matchCount: number;
+  ready: boolean;
   close(): Promise<void>;
 }
 
 export const PROTOCOL_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
 
 const SNAPSHOT = ['- heading "Tauri Lab" [level=1]', '- button "Submit"'].join("\n");
+
+const LAYOUT_SNAPSHOT = [
+  "- viewport: 1280x800 scroll 0,0",
+  '- heading "Tauri Lab" [level=1] @16,16 400x40',
+  '- button "Submit" @1040,700 120x36',
+  '- checkbox "Cryptography" @0,0 0x0 [zero-size]',
+].join("\n");
 
 function screenshotBase64(width: number, height: number): string {
   const png = new PNG({ width, height });
@@ -34,6 +43,7 @@ export async function startFakeWebDriver(): Promise<FakeWebDriver> {
   const requests: RecordedRequest[] = [];
   const scripts: string[] = [];
   let runtimeInstalled = false;
+  const state = { matchCount: 1, ready: true };
 
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -77,8 +87,8 @@ export async function startFakeWebDriver(): Promise<FakeWebDriver> {
         }
         if (script.includes('"readiness"')) {
           return reply({
-            ready: true,
-            reason: "ok",
+            ready: state.ready,
+            reason: state.ready ? "ok" : "no rendered content",
             url: "tauri://localhost/",
             title: "Tauri Lab",
             readyState: "complete",
@@ -89,8 +99,10 @@ export async function startFakeWebDriver(): Promise<FakeWebDriver> {
             lastPageError: null,
           });
         }
-        if (script.includes('"snapshot"')) return reply(SNAPSHOT);
-        if (script.includes('"mark"')) return reply(1);
+        if (script.includes('"snapshot"')) {
+          return reply(body?.args?.[0]?.layout === true ? LAYOUT_SNAPSHOT : SNAPSHOT);
+        }
+        if (script.includes('"mark"')) return reply(state.matchCount);
         if (script.includes('"clearMarks"')) return reply(null);
         if (script.includes('"textOf"')) return reply(["Submit"]);
         if (script.includes('"drain"')) {
@@ -120,6 +132,18 @@ export async function startFakeWebDriver(): Promise<FakeWebDriver> {
     url: `http://127.0.0.1:${port}`,
     requests,
     scripts,
+    get matchCount(): number {
+      return state.matchCount;
+    },
+    set matchCount(value: number) {
+      state.matchCount = value;
+    },
+    get ready(): boolean {
+      return state.ready;
+    },
+    set ready(value: boolean) {
+      state.ready = value;
+    },
     close: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();

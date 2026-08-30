@@ -1,6 +1,6 @@
 export type Surface = "web" | "tauri";
 
-export type SnapMode = "text" | "png" | "both";
+export type SnapMode = "text" | "png" | "both" | "layout";
 
 export interface Viewport {
   width: number;
@@ -103,9 +103,18 @@ export type NormalizedStep =
   | { key: string }
   | { wait_for: string }
   | { assert_text: string | AssertTextStepBody }
+  | { assert_absent: string }
   | { snap: SnapStepBody };
 
-export type StepKind = "open" | "click" | "type" | "key" | "wait_for" | "assert_text" | "snap";
+export type StepKind =
+  | "open"
+  | "click"
+  | "type"
+  | "key"
+  | "wait_for"
+  | "assert_text"
+  | "assert_absent"
+  | "snap";
 
 export interface ActParams {
   sessionId: string;

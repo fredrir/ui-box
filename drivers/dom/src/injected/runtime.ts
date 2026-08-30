@@ -12,6 +12,7 @@ export interface SnapshotConfig {
   maxLines: number;
   maxTextLength: number;
   includeHidden: boolean;
+  layout?: boolean;
 }
 
 export interface ReadinessReport {
@@ -69,6 +70,7 @@ export interface UiboxRuntimeApi {
   snapshot(config: SnapshotConfig): string;
   readiness(): ReadinessReport;
   mark(spec: RuntimeSelectorSpec, token: string): number;
+  labelProxy(el: Element, token: string): boolean;
   clearMarks(token: string): void;
   textOf(spec: RuntimeSelectorSpec, limit: number): string[];
   drain(): RuntimeDrain;
@@ -418,10 +420,66 @@ export function uiboxRuntime(config: RuntimeConfig): void {
     return owned ? owned : null;
   }
 
+  function layoutOf(el: Element): string {
+    const rect = el.getBoundingClientRect();
+    const box = ` @${Math.round(rect.left)},${Math.round(rect.top)} ${Math.round(rect.width)}x${Math.round(rect.height)}`;
+    if (rect.width < 1 || rect.height < 1) return `${box} [zero-size]`;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= vh || rect.left >= vw) {
+      return `${box} [offscreen]`;
+    }
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), vw - 1);
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), vh - 1);
+    const top = document.elementFromPoint(x, y);
+    if (top && top !== el && !el.contains(top)) return `${box} [occluded]`;
+    return box;
+  }
+
+  function isClickProxyControl(el: Element): boolean {
+    if (el.tagName !== "INPUT") return false;
+    const type = normalize(attr(el, "type")).toLowerCase();
+    return type === "checkbox" || type === "radio" || type === "file";
+  }
+
+  function hasNoClickableBox(el: Element): boolean {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return true;
+    return window.getComputedStyle(el).opacity === "0";
+  }
+
+  function associatedLabel(el: Element): Element | null {
+    const labels = (el as HTMLInputElement).labels;
+    if (labels) {
+      for (const label of Array.from(labels)) {
+        if (isVisible(label) && !hasNoClickableBox(label)) return label;
+      }
+    }
+    const wrapper = el.closest ? el.closest("label") : null;
+    if (wrapper && isVisible(wrapper) && !hasNoClickableBox(wrapper)) return wrapper;
+    return null;
+  }
+
+  function interactionTarget(el: Element): Element {
+    if (!isClickProxyControl(el)) return el;
+    if (!hasNoClickableBox(el)) return el;
+    return associatedLabel(el) ?? el;
+  }
+
+  function retarget(matches: Element[]): Element[] {
+    const out: Element[] = [];
+    for (const el of matches) {
+      const target = interactionTarget(el);
+      if (out.indexOf(target) === -1) out.push(target);
+    }
+    return out;
+  }
+
   function snapshot(snapConfig: SnapshotConfig): string {
     const maxLines = snapConfig.maxLines > 0 ? snapConfig.maxLines : 1200;
     const maxTextLength = snapConfig.maxTextLength > 0 ? snapConfig.maxTextLength : 160;
     const includeHidden = snapConfig.includeHidden === true;
+    const withLayout = snapConfig.layout === true;
     let budget = maxLines;
     let overflow = 0;
 
@@ -436,6 +494,7 @@ export function uiboxRuntime(config: RuntimeConfig): void {
       name: string;
       attrs: string[];
       value: string | null;
+      layout: string;
       children: SnapNode[];
     }
     interface TextNode {
@@ -510,6 +569,7 @@ export function uiboxRuntime(config: RuntimeConfig): void {
             name: clamp(src),
             attrs: [],
             value: null,
+            layout: withLayout ? layoutOf(el) : "",
             children: [],
           },
         ];
@@ -522,7 +582,8 @@ export function uiboxRuntime(config: RuntimeConfig): void {
 
       budget -= 1;
       const children = NAME_FROM_CONTENT[role] && name ? [] : collectChildren(el);
-      return [{ kind: "element", role, name: clamp(name), attrs, value, children }];
+      const layout = withLayout ? layoutOf(el) : "";
+      return [{ kind: "element", role, name: clamp(name), attrs, value, layout, children }];
     }
 
     function render(nodes: SnapNode[], depth: number, out: string[]): void {
@@ -535,6 +596,7 @@ export function uiboxRuntime(config: RuntimeConfig): void {
         let line = `${pad}- ${node.role}`;
         if (node.name) line += ` "${node.name.replace(/"/g, '\\"')}"`;
         for (const item of node.attrs) line += ` [${item}]`;
+        line += node.layout;
         if (node.value !== null) line += `: ${node.value}`;
         else if (node.children.length > 0) line += ":";
         out.push(line);
@@ -544,6 +606,11 @@ export function uiboxRuntime(config: RuntimeConfig): void {
 
     if (!document.body) return "- document: (no body)";
     const lines: string[] = [];
+    if (withLayout) {
+      lines.push(
+        `- viewport: ${window.innerWidth}x${window.innerHeight} scroll ${Math.round(window.scrollX)},${Math.round(window.scrollY)}`,
+      );
+    }
     render(collectChildren(document.body), 0, lines);
     if (overflow > 0) lines.push(`- … ${overflow} more nodes omitted (line budget reached)`);
     if (lines.length === 0) return "- document: (empty body)";
@@ -885,9 +952,15 @@ export function uiboxRuntime(config: RuntimeConfig): void {
     snapshot,
     readiness,
     mark(spec: RuntimeSelectorSpec, token: string): number {
-      const matches = resolve(spec);
+      const matches = retarget(resolve(spec));
       for (let i = 0; i < matches.length; i += 1) matches[i]!.setAttribute("data-uibox-hit", token);
       return matches.length;
+    },
+    labelProxy(el: Element, token: string): boolean {
+      const target = interactionTarget(el);
+      if (target === el) return false;
+      target.setAttribute("data-uibox-hit", token);
+      return true;
     },
     clearMarks(token: string): void {
       for (const el of Array.from(document.querySelectorAll(`[data-uibox-hit="${token}"]`))) {

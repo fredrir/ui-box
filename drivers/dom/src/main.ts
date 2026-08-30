@@ -2,6 +2,7 @@
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { probeTauriBins, resolveTauriBins } from "./backend/webdriver.js";
+import { envString } from "./config.js";
 import { DriverError, RPC_INVALID_PARAMS, RPC_SESSION_NOT_FOUND } from "./errors.js";
 import { RpcServer } from "./rpc.js";
 import { Session } from "./session.js";
@@ -99,7 +100,7 @@ async function main(): Promise<void> {
     version,
     surfaces: SURFACES,
     selectors: ["css", "role", "text"],
-    modes: ["text", "png", "both"],
+    modes: ["text", "png", "both", "layout"],
     tauri: tauriCapability(),
   }));
 
@@ -124,16 +125,22 @@ async function main(): Promise<void> {
   await registry.closeAll();
 }
 
+function displayFault(): string | null {
+  if (process.platform !== "linux") return null;
+  if (envString("DISPLAY") || envString("WAYLAND_DISPLAY")) return null;
+  return "neither DISPLAY nor WAYLAND_DISPLAY is set, and WebKitWebDriver cannot run without one";
+}
+
 function tauriCapability(): Record<string, unknown> {
   const bins = resolveTauriBins({});
   const probe = probeTauriBins(bins);
-  const ok = probe.reason === null;
+  const faults = [probe.reason, displayFault()].filter((fault) => fault !== null);
   return {
-    ok,
+    ok: faults.length === 0,
     tauriDriver: probe.tauriDriver,
     nativeDriver: probe.nativeDriver,
     source: bins.source,
-    reason: ok ? NO_OVERRIDE_SCOPE : `${probe.reason}; ${NO_OVERRIDE_SCOPE}`,
+    reason: [...faults, NO_OVERRIDE_SCOPE].join("; "),
   };
 }
 
@@ -161,7 +168,7 @@ async function actOnSession(registry: SessionRegistry, params: ActParams): Promi
 async function snapSession(registry: SessionRegistry, params: SnapParams): Promise<unknown> {
   const session = registry.get(params?.sessionId);
   const mode = (params?.mode ?? "text") as SnapMode;
-  if (mode !== "text" && mode !== "png" && mode !== "both") {
+  if (mode !== "text" && mode !== "png" && mode !== "both" && mode !== "layout") {
     throw new DriverError("params", `invalid snap mode "${String(mode)}"`, RPC_INVALID_PARAMS);
   }
   return session.snap(mode, params?.name);
