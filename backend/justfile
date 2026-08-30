@@ -388,7 +388,7 @@ deploy *args:
     if command -v nixos-rebuild >/dev/null 2>&1; then
         nixos-rebuild switch --flake ".#{{ vm }}" --target-host "{{ vm }}" --sudo {{ args }}
     else
-        nix develop -c nixos-rebuild switch --flake ".#{{ vm }}" --target-host "{{ vm }}" --sudo {{ args }}
+        nix develop .#backend -c nixos-rebuild switch --flake ".#{{ vm }}" --target-host "{{ vm }}" --sudo {{ args }}
     fi
 
 # SSH into the VM, waking it if it is asleep

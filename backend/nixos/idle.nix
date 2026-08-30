@@ -26,6 +26,13 @@ let
       # to the root overlay where the host cannot see them, and the host would
       # read the silence as "this guest booted a moment ago" forever. Refuse
       # rather than write somewhere nobody is reading.
+      #
+      # state.nix mounts the share nofail on purpose, so a guest whose share is
+      # missing still boots and can be logged into. That makes this check the
+      # thing standing between an unmounted share and markers nobody reads, so
+      # it exits non-zero rather than 0. A failed Assert would not do: it leaves
+      # the unit inactive rather than failed, and `systemctl --failed` answers
+      # clean.
       if ! mountpoint -q "$state"; then
           echo "$state is not a mount point: markers written here are invisible to the host" >&2
           exit 1
