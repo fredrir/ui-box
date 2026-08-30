@@ -283,3 +283,13 @@ fn doctor_makes_no_forward_claim_when_no_forward_was_declared() {
         "with nothing to check, doctor must stay silent rather than report a pass"
     );
 }
+
+#[test]
+fn a_declared_forward_is_reported_without_blocking_the_live_loop() {
+    let body = summary(&ui_box_env(&["doctor"], &[("UIBOX_FORWARD", "3000")]));
+    assert_eq!(
+        severity(&body, "forward"),
+        "advisory",
+        "a dev server that is not up yet is the environment, not ui-box failing to run"
+    );
+}

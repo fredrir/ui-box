@@ -59,6 +59,23 @@ pub fn ssh_args(forwards: &[Forward]) -> Vec<String> {
     args
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalEnd {
+    Listening,
+    Ipv6Only,
+    Closed,
+}
+
+pub fn probe_local_end(forward: &Forward) -> LocalEnd {
+    if listening(forward.connect_host(), forward.local_port) {
+        return LocalEnd::Listening;
+    }
+    if forward.is_default_host() && listening("::1", forward.local_port) {
+        return LocalEnd::Ipv6Only;
+    }
+    LocalEnd::Closed
+}
+
 pub fn labels(forwards: &[Forward]) -> String {
     forwards
         .iter()
@@ -139,23 +156,20 @@ pub fn classify(error: anyhow::Error, config: &Config) -> anyhow::Error {
 }
 
 fn preflight(forward: &Forward) -> Result<()> {
-    let host = forward.connect_host();
-    if listening(host, forward.local_port) {
-        return Ok(());
-    }
-    if forward.is_default_host() && listening("::1", forward.local_port) {
-        return Err(ForwardError::LocalIpv6Only {
+    match probe_local_end(forward) {
+        LocalEnd::Listening => Ok(()),
+        LocalEnd::Ipv6Only => Err(ForwardError::LocalIpv6Only {
             spec: forward.label(),
             local: forward.local_port,
             suggestion: format!("{}:[::1]:{}", forward.lab_port, forward.local_port),
         }
-        .into());
+        .into()),
+        LocalEnd::Closed => Err(ForwardError::LocalClosed {
+            spec: forward.label(),
+            endpoint: endpoint(forward.connect_host(), forward.local_port),
+        }
+        .into()),
     }
-    Err(ForwardError::LocalClosed {
-        spec: forward.label(),
-        endpoint: endpoint(host, forward.local_port),
-    }
-    .into())
 }
 
 fn listening(host: &str, port: u16) -> bool {
@@ -354,6 +368,37 @@ mod tests {
             ),
             "{message}"
         );
+    }
+
+    #[test]
+    fn a_default_host_forward_is_probed_at_the_address_it_names() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let open = crate::config::parse_forwards(&format!("3000:{port}")).expect("forwards");
+        assert_eq!(probe_local_end(&open[0]), LocalEnd::Listening);
+
+        let closed =
+            crate::config::parse_forwards(&format!("3000:{PORT_NO_UNPRIVILEGED_PROCESS_CAN_BIND}"))
+                .expect("forwards");
+        assert_eq!(probe_local_end(&closed[0]), LocalEnd::Closed);
+    }
+
+    #[test]
+    fn an_ipv6_only_listener_is_not_a_listening_default_host_forward() {
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            return;
+        };
+        let port = listener.local_addr().expect("addr").port();
+        let named = crate::config::parse_forwards(&format!("3000:{port}")).expect("forwards");
+        assert_eq!(
+            probe_local_end(&named[0]),
+            LocalEnd::Ipv6Only,
+            "the spec names 127.0.0.1, which is the address ssh -R will connect to"
+        );
+
+        let explicit =
+            crate::config::parse_forwards(&format!("3000:[::1]:{port}")).expect("forwards");
+        assert_eq!(probe_local_end(&explicit[0]), LocalEnd::Listening);
     }
 
     #[test]

@@ -219,6 +219,28 @@ mod tests {
     }
 
     #[test]
+    fn an_app_arg_containing_a_space_survives_as_one_argument() {
+        let mut config = bare();
+        config.app_args = Some(vec![
+            "--open".to_string(),
+            "/a path with spaces.tex".to_string(),
+        ]);
+        let options = driver_options(&config, Surface::Tauri, Path::new("/tmp/run"));
+        assert_eq!(
+            options["appArgs"],
+            json!(["--open", "/a path with spaces.tex"])
+        );
+    }
+
+    #[test]
+    fn an_empty_app_arg_list_is_not_sent_at_all() {
+        let mut config = bare();
+        config.app_args = Some(Vec::new());
+        let options = driver_options(&config, Surface::Tauri, Path::new("/tmp/run"));
+        assert!(!options.as_object().expect("object").contains_key("appArgs"));
+    }
+
+    #[test]
     fn a_tauri_open_carries_only_what_was_configured() {
         let mut config = bare();
         config.tauri_driver = Some("/nix/store/aaa/bin/tauri-driver".to_string());

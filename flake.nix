@@ -146,6 +146,8 @@
               "ui-box"
             ];
 
+            nativeCheckInputs = [ pkgs.git ];
+
             meta = {
               description = "Live UI testing CLI";
               mainProgram = "ui-box";

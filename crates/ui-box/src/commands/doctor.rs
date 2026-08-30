@@ -1,6 +1,3 @@
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
-
 use anyhow::Result;
 use serde_json::{json, Value};
 
@@ -8,6 +5,7 @@ use super::terminate;
 use crate::backend::{self, proxy_hop, shell_quote, which, Backend, Cmd};
 use crate::config::{Config, Surface};
 use crate::driver::client::TauriInfo;
+use crate::driver::forward::{self, LocalEnd};
 use crate::driver::{self, Connection, DriverInfo};
 use crate::error::backend_failure;
 use crate::note;
@@ -18,7 +16,6 @@ use crate::vision::Vision;
 
 const LAB_LOOPBACK: &str = "127.0.0.1";
 const PROBE_TIMEOUT: u64 = 5;
-const PREFLIGHT_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
@@ -139,7 +136,7 @@ pub fn doctor(config: &Config) -> Result<Summary> {
     checks.push(check_tui().advisory());
 
     if let Some(check) = check_forward(config, lab) {
-        checks.push(check);
+        checks.push(check.advisory());
     }
     if let Some(check) = check_target(config, lab) {
         checks.push(check.advisory());
@@ -381,26 +378,8 @@ fn first_line(text: &str) -> String {
         .to_string()
 }
 
-fn local_listener(host: &str, port: u16) -> Result<(), String> {
-    let addrs: Vec<SocketAddr> = match (host, port).to_socket_addrs() {
-        Ok(addrs) => addrs.collect(),
-        Err(err) => return Err(format!("{host} does not resolve here: {err}")),
-    };
-    if addrs.is_empty() {
-        return Err(format!("{host} does not resolve here"));
-    }
-    let mut failure = String::new();
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, PREFLIGHT_TIMEOUT) {
-            Ok(_) => return Ok(()),
-            Err(err) => failure = format!("{addr}: {err}"),
-        }
-    }
-    Err(failure)
-}
-
 fn check_forward(config: &Config, lab: Option<&dyn Backend>) -> Option<Check> {
-    let forwards = declared_forwards(config);
+    let forwards = &config.forward;
     if forwards.is_empty() {
         return None;
     }
@@ -417,20 +396,32 @@ fn check_forward(config: &Config, lab: Option<&dyn Backend>) -> Option<Check> {
 
     let mut ok = true;
     let mut lines = Vec::new();
-    for (lab_port, local_host, local_port) in &forwards {
-        let here = match local_listener(local_host, *local_port) {
-            Ok(()) => format!("{local_host}:{local_port} is listening here"),
-            Err(err) => {
+    for forward in forwards {
+        let lab_port = forward.lab_port;
+        let local_host = forward.connect_host();
+        let local_port = forward.local_port;
+        let here = match forward::probe_local_end(forward) {
+            LocalEnd::Listening => format!("{local_host}:{local_port} is listening here"),
+            LocalEnd::Ipv6Only => {
+                ok = false;
+                format!(
+                    "nothing is listening on {local_host}:{local_port}, which is where \
+                     ssh -R will dial. Something answers on [::1]:{local_port}, but that \
+                     is not the address ssh will look at, so `open` will refuse this. Bind \
+                     the server to {local_host}, or declare {lab_port}:[::1]:{local_port}"
+                )
+            }
+            LocalEnd::Closed => {
                 ok = false;
                 format!(
                     "nothing is listening on {local_host}:{local_port} here, so lab {lab_port} \
-                     would publish a dead port ({err})"
+                     would publish a dead port"
                 )
             }
         };
         let there = match lab {
             None => "the backend did not answer, so the lab end was not probed".to_string(),
-            Some(lab) => match probe_from_lab(lab, LAB_LOOPBACK, *lab_port) {
+            Some(lab) => match probe_from_lab(lab, LAB_LOOPBACK, lab_port) {
                 Probe::Refused => {
                     format!("lab {LAB_LOOPBACK}:{lab_port} is free for ssh -R to bind")
                 }
@@ -505,10 +496,7 @@ fn refused(config: &Config, target: &str, host: &str, port: u16) -> String {
     if config.backend.host().is_none() {
         return format!("{target} refused the connection. Nothing is listening on {host}:{port}.");
     }
-    if declared_forwards(config)
-        .iter()
-        .any(|(lab_port, _, _)| *lab_port == port)
-    {
+    if covers_port(config, port) {
         return format!(
             "{target} names the lab's own loopback. Nothing answers there, even though a \
              forward publishes {port} into the lab. Check that this machine is serving it."
@@ -551,18 +539,11 @@ fn http_endpoint(target: &str) -> Option<(String, u16)> {
     }
 }
 
-fn declared_forwards(config: &Config) -> Vec<(u16, String, u16)> {
+fn covers_port(config: &Config, port: u16) -> bool {
     config
         .forward
         .iter()
-        .map(|forward| {
-            (
-                forward.lab_port,
-                forward.connect_host().to_string(),
-                forward.local_port,
-            )
-        })
-        .collect()
+        .any(|forward| forward.lab_port == port)
 }
 
 fn check_vision(config: &Config) -> Check {
@@ -762,6 +743,69 @@ mod tests {
         config.backend = crate::config::BackendSpec::parse("ssh://fredrir@dlab-ui").unwrap();
         let detail = refused(&config, "http://example.test:80", "example.test", 80);
         assert!(!detail.contains("--forward"), "{detail}");
+    }
+
+    fn lab_config(forwards: Vec<crate::config::Forward>) -> Config {
+        let mut config = config_for(None);
+        config.backend = crate::config::BackendSpec::parse("ssh://fredrir@dlab-ui").unwrap();
+        config.forward = forwards;
+        config
+    }
+
+    #[test]
+    fn an_ipv6_only_dev_server_is_not_reported_as_a_working_forward() {
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            return;
+        };
+        let port = listener.local_addr().expect("addr").port();
+        let config = lab_config(vec![crate::config::Forward {
+            lab_port: 3000,
+            local_host: "127.0.0.1".to_string(),
+            local_port: port,
+        }]);
+        let check = check_forward(&config, None).expect("a declared forward is checked");
+        assert!(
+            !check.ok,
+            "`open` refuses this, so doctor must not call it fine: {}",
+            check.detail
+        );
+        assert!(check.detail.contains("[::1]"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_forward_naming_the_address_its_server_answers_on_reads_as_listening() {
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            return;
+        };
+        let port = listener.local_addr().expect("addr").port();
+        let config = lab_config(vec![crate::config::Forward {
+            lab_port: 3000,
+            local_host: "::1".to_string(),
+            local_port: port,
+        }]);
+        let check = check_forward(&config, None).expect("a declared forward is checked");
+        assert!(
+            check.detail.contains("is listening here"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn a_declared_forward_never_makes_doctor_unusable() {
+        let config = lab_config(vec![crate::config::Forward {
+            lab_port: 3000,
+            local_host: "127.0.0.1".to_string(),
+            local_port: 1,
+        }]);
+        let check = check_forward(&config, None)
+            .expect("a declared forward is checked")
+            .advisory();
+        assert!(!check.ok);
+        assert!(
+            !check.blocks(),
+            "a dev server that is not up yet is not ui-box failing to run"
+        );
     }
 
     #[test]

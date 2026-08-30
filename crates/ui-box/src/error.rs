@@ -65,9 +65,10 @@ pub enum ForwardError {
     LocalClosed { spec: String, endpoint: String },
 
     #[error(
-        "--forward {spec} would publish 127.0.0.1:{local}, where nothing is listening, but \
-         [::1]:{local} answers. The local server bound IPv6 only. The UI was never asked. \
-         Bind it to 127.0.0.1, or reach it as it stands with --forward {suggestion}"
+        "--forward {spec} dials 127.0.0.1:{local}, where nothing is listening. Something \
+         answers on [::1]:{local}, but that is not the address ssh will look at. The local \
+         server bound IPv6 only. The UI was never asked. Bind it to 127.0.0.1, or name it \
+         with --forward {suggestion}"
     )]
     LocalIpv6Only {
         spec: String,
