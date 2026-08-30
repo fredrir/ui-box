@@ -14,8 +14,14 @@ export interface FakeWebDriver {
   scripts: string[];
   matchCount: number;
   ready: boolean;
+  visibility: any;
+  evalDescriptor: any;
   close(): Promise<void>;
 }
+
+export const ACCENT_RECT = { x: 300, y: 120, width: 2, height: 64 };
+export const ACCENT_COLOR = { r: 214, g: 64, b: 96 };
+export const PANEL_COLOR = { r: 40, g: 44, b: 52 };
 
 export const PROTOCOL_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
 
@@ -31,19 +37,51 @@ const LAYOUT_SNAPSHOT = [
 function screenshotBase64(width: number, height: number): string {
   const png = new PNG({ width, height });
   for (let i = 0; i < png.data.length; i += 4) {
-    png.data[i] = 40;
-    png.data[i + 1] = 44;
-    png.data[i + 2] = 52;
+    png.data[i] = PANEL_COLOR.r;
+    png.data[i + 1] = PANEL_COLOR.g;
+    png.data[i + 2] = PANEL_COLOR.b;
     png.data[i + 3] = 255;
   }
+  for (let y = ACCENT_RECT.y; y < ACCENT_RECT.y + ACCENT_RECT.height; y += 1) {
+    for (let x = ACCENT_RECT.x; x < ACCENT_RECT.x + ACCENT_RECT.width; x += 1) {
+      const index = (width * y + x) << 2;
+      png.data[index] = ACCENT_COLOR.r;
+      png.data[index + 1] = ACCENT_COLOR.g;
+      png.data[index + 2] = ACCENT_COLOR.b;
+      png.data[index + 3] = 255;
+    }
+  }
   return PNG.sync.write(png).toString("base64");
+}
+
+function defaultVisibility(): any {
+  return {
+    matches: 1,
+    rect: { ...ACCENT_RECT },
+    viewport: { width: 1280, height: 800 },
+    devicePixelRatio: 1,
+    visible: true,
+    hitTest: "self",
+    reasons: [],
+    styles: {
+      display: "block",
+      visibility: "visible",
+      opacity: "1",
+      backgroundColor: "rgb(214, 64, 96)",
+    },
+  };
 }
 
 export async function startFakeWebDriver(): Promise<FakeWebDriver> {
   const requests: RecordedRequest[] = [];
   const scripts: string[] = [];
   let runtimeInstalled = false;
-  const state = { matchCount: 1, ready: true };
+  const state = {
+    matchCount: 1,
+    ready: true,
+    visibility: defaultVisibility(),
+    evalDescriptor: { kind: "number", serializable: true, json: "42", threw: false, detail: null },
+  };
 
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -103,6 +141,8 @@ export async function startFakeWebDriver(): Promise<FakeWebDriver> {
           return reply(body?.args?.[0]?.layout === true ? LAYOUT_SNAPSHOT : SNAPSHOT);
         }
         if (script.includes('"mark"')) return reply(state.matchCount);
+        if (script.includes('"describeElement"')) return reply(state.visibility);
+        if (script.includes("describeValue")) return reply(state.evalDescriptor);
         if (script.includes('"clearMarks"')) return reply(null);
         if (script.includes('"textOf"')) return reply(["Submit"]);
         if (script.includes('"drain"')) {
@@ -143,6 +183,18 @@ export async function startFakeWebDriver(): Promise<FakeWebDriver> {
     },
     set ready(value: boolean) {
       state.ready = value;
+    },
+    get visibility(): any {
+      return state.visibility;
+    },
+    set visibility(value: any) {
+      state.visibility = value;
+    },
+    get evalDescriptor(): any {
+      return state.evalDescriptor;
+    },
+    set evalDescriptor(value: any) {
+      state.evalDescriptor = value;
     },
     close: () =>
       new Promise<void>((resolve) => {

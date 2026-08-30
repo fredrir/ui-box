@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::backend::Backend;
+use crate::driver::client::NOTHING_VERIFIED;
 use crate::driver::Connection;
 use crate::flow::{SnapMode, SnapStep, Step};
 use crate::note;
@@ -23,7 +24,18 @@ pub struct SnapArtifacts {
 pub struct StepOutcome {
     pub ok: bool,
     pub error: Option<String>,
+    pub kind: Option<String>,
     pub snap: Option<SnapArtifacts>,
+}
+
+impl StepOutcome {
+    pub fn verified_nothing(&self) -> bool {
+        !self.ok && self.kind.as_deref() == Some(NOTHING_VERIFIED)
+    }
+
+    pub fn failed(&self) -> bool {
+        !self.ok && !self.verified_nothing()
+    }
 }
 
 pub struct Executor {
@@ -33,6 +45,7 @@ pub struct Executor {
     pub default_mode: SnapMode,
     pub total: usize,
     pub failed: usize,
+    pub nothing: usize,
     pub backend: Option<Box<dyn Backend>>,
 }
 
@@ -45,6 +58,7 @@ impl Executor {
             default_mode: SnapMode::Text,
             total: start_index,
             failed: 0,
+            nothing: 0,
             backend: None,
         }
     }
@@ -121,7 +135,9 @@ impl Executor {
         }
         match result {
             Ok(outcome) => {
-                if !outcome.ok {
+                if outcome.verified_nothing() {
+                    self.nothing += 1;
+                } else if !outcome.ok {
                     self.failed += 1;
                 }
                 Ok(outcome)
@@ -158,6 +174,7 @@ impl Executor {
             return Ok(StepOutcome {
                 ok: true,
                 error: None,
+                kind: None,
                 snap: Some(artifacts),
             });
         }
@@ -166,6 +183,7 @@ impl Executor {
         Ok(StepOutcome {
             ok: result.ok,
             error: result.error_text(),
+            kind: result.error_kind().map(str::to_string),
             snap: None,
         })
     }
@@ -230,6 +248,41 @@ pub fn snap_json(artifacts: &SnapArtifacts) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome(ok: bool, kind: Option<&str>) -> StepOutcome {
+        StepOutcome {
+            ok,
+            error: None,
+            kind: kind.map(str::to_string),
+            snap: None,
+        }
+    }
+
+    #[test]
+    fn a_step_that_verified_nothing_is_not_counted_as_a_failure() {
+        let nothing = outcome(false, Some(NOTHING_VERIFIED));
+        assert!(nothing.verified_nothing());
+        assert!(
+            !nothing.failed(),
+            "reporting this as a step failure blames the application for a page that never rendered"
+        );
+    }
+
+    #[test]
+    fn a_real_assertion_failure_is_never_softened() {
+        for kind in [Some("assertion"), None, Some("selector")] {
+            let failure = outcome(false, kind);
+            assert!(failure.failed(), "{kind:?}");
+            assert!(!failure.verified_nothing(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_passing_step_is_neither() {
+        let pass = outcome(true, None);
+        assert!(!pass.failed());
+        assert!(!pass.verified_nothing());
+    }
 
     #[test]
     fn inline_text_measures_the_response() {

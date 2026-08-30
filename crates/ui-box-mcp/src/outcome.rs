@@ -19,11 +19,27 @@ pub const REQUEST_BANNER: &str = "\
 INVALID TOOL ARGUMENTS -- NOTHING WAS RUN.
 No ui-box command was executed, so nothing is known about the UI or the tooling.";
 
-pub const NOTHING_BANNER: &str = "\
+pub const NOTHING_RAN_BANNER: &str = "\
 NOTHING WAS VERIFIED -- THIS IS NOT A PASS.
-verify exited 0 without replaying a single flow, so no UI was exercised and nothing was
-proven about it. Here a 0 means \"no work was done\", not \"the UI is correct\". Do not
-report the UI as verified on the strength of this result.";
+No flow was replayed, so no UI was exercised and nothing was proven about it. Here a 0
+means \"no work was done\", not \"the UI is correct\". Do not report the UI as verified on
+the strength of this result.";
+
+pub const NOTHING_PROVEN_BANNER: &str = "\
+NOTHING WAS VERIFIED -- THIS IS NOT A PASS.
+The UI was exercised, but an assertion could not prove anything about the page it looked
+at: an absence on a page that never rendered is not evidence. Here a 0 means \"nothing was
+proven\", not \"the UI is correct\" -- and it is not the application failing either.";
+
+pub const UNKNOWN_VERDICT_BANNER: &str = "\
+UNRECOGNISED VERDICT -- THIS IS NOT A PASS.
+ui-box reported a verdict this build does not know how to read, so nothing can be
+concluded from it either way. Treat it as unverified rather than guessing which side it
+falls on.";
+
+pub const NOTHING_STATUS: &str = "nothing_verified";
+
+const KNOWN_VERDICTS: [&str; 4] = ["pass", "fail", "error", NOTHING_STATUS];
 
 pub const BLANK_BANNER: &str = "\
 BLANK SNAPSHOT -- THE PAGE RENDERED NOTHING.
@@ -69,7 +85,7 @@ pub struct Report {
     images: Vec<Vec<u8>>,
     facts: Map<String, Value>,
     failure: Option<(Domain, String)>,
-    inconclusive: Option<String>,
+    inconclusive: Option<(&'static str, String)>,
 }
 
 impl Report {
@@ -137,8 +153,16 @@ impl Report {
     }
 
     pub fn inconclusive(&mut self, reason: impl Into<String>) -> &mut Report {
+        self.nothing(NOTHING_RAN_BANNER, reason)
+    }
+
+    pub fn proved_nothing(&mut self, reason: impl Into<String>) -> &mut Report {
+        self.nothing(NOTHING_PROVEN_BANNER, reason)
+    }
+
+    fn nothing(&mut self, banner: &'static str, reason: impl Into<String>) -> &mut Report {
         if self.inconclusive.is_none() {
-            self.inconclusive = Some(reason.into());
+            self.inconclusive = Some((banner, reason.into()));
         }
         self
     }
@@ -155,7 +179,24 @@ impl Report {
         self.facts_from(&invocation.summary());
 
         match &invocation.landing {
-            Landing::Passed => {}
+            Landing::Passed => {
+                let summary = invocation.summary();
+                if let Some(reason) = proved_nothing_reason(&summary) {
+                    if summary.get("skipped").and_then(Value::as_bool) == Some(true) {
+                        self.inconclusive(reason);
+                    } else {
+                        self.proved_nothing(reason);
+                    }
+                } else if let Some(verdict) = unknown_verdict(&summary) {
+                    self.nothing(
+                        UNKNOWN_VERDICT_BANNER,
+                        format!(
+                            "ui-box reported verdict {verdict:?}, which this build does not \
+                             recognise, so it cannot be read as a pass or as a failure"
+                        ),
+                    );
+                }
+            }
             Landing::Failed if invocation.summary().is_null() => {
                 self.failed(
                     Domain::Tooling,
@@ -213,7 +254,7 @@ impl Report {
         let mut text = String::new();
         let preamble = match (&self.failure, &self.inconclusive) {
             (Some((domain, reason)), _) => Some((domain.banner(), reason)),
-            (None, Some(reason)) => Some((NOTHING_BANNER, reason)),
+            (None, Some((banner, reason))) => Some((*banner, reason)),
             (None, None) => None,
         };
         if let Some((banner, reason)) = preamble {
@@ -246,9 +287,9 @@ impl Report {
                 structured.insert("failure_domain".to_string(), Value::from(domain.label()));
                 structured.insert("reason".to_string(), Value::from(reason.clone()));
             }
-            (None, Some(reason)) => {
+            (None, Some((_, reason))) => {
                 structured.insert("ok".to_string(), Value::Bool(false));
-                structured.insert("status".to_string(), Value::from("nothing_verified"));
+                structured.insert("status".to_string(), Value::from(NOTHING_STATUS));
                 structured.insert("failure_domain".to_string(), Value::Null);
                 structured.insert("reason".to_string(), Value::from(reason.clone()));
             }
@@ -265,5 +306,148 @@ impl Report {
         };
         result.structured_content = Some(Value::Object(structured));
         result
+    }
+}
+
+fn proved_nothing_reason(summary: &Value) -> Option<String> {
+    if summary.get("status").and_then(Value::as_str) != Some(NOTHING_STATUS) {
+        return None;
+    }
+    if let Some(reason) = summary.get("reason").and_then(Value::as_str) {
+        return Some(reason.to_string());
+    }
+    if let Some(error) = summary.get("error").and_then(Value::as_str) {
+        return Some(error.to_string());
+    }
+    let nothing = summary
+        .get("steps_nothing")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = summary
+        .get("steps_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(format!(
+        "{nothing} of {total} step(s) could not prove anything about the page"
+    ))
+}
+
+fn unknown_verdict(summary: &Value) -> Option<String> {
+    let verdict = summary.get("verdict").and_then(Value::as_str)?;
+    if KNOWN_VERDICTS.contains(&verdict) {
+        return None;
+    }
+    Some(verdict.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::uibox::{Invocation, Landing};
+
+    fn ran(landing: Landing, summary: &str) -> Invocation {
+        Invocation {
+            argv: vec!["run".to_string()],
+            landing,
+            stdout: format!("{summary}\n"),
+            stderr: String::new(),
+        }
+    }
+
+    fn absorbed(invocation: &Invocation) -> (Value, String) {
+        let mut report = Report::new("headline.".to_string());
+        report.absorb(invocation);
+        let built = report.build();
+        let structured = built.structured_content.clone().unwrap_or(Value::Null);
+        let text = built
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<String>>()
+            .join("\n");
+        (structured, text)
+    }
+
+    #[test]
+    fn a_run_that_proved_nothing_is_not_reported_as_passed() {
+        let invocation = ran(
+            Landing::Passed,
+            r#"{"ok":false,"status":"nothing_verified","verdict":"nothing_verified","steps_failed":0,"steps_nothing":1,"steps_total":2}"#,
+        );
+        let (structured, text) = absorbed(&invocation);
+        assert_eq!(structured["ok"], false);
+        assert_eq!(structured["status"], "nothing_verified");
+        assert_eq!(structured["steps_nothing"], 1);
+        assert!(text.contains("THIS IS NOT A PASS"), "{text}");
+        assert!(
+            text.contains("The UI was exercised"),
+            "a run that replayed steps must not borrow verify's no-flows wording: {text}"
+        );
+    }
+
+    #[test]
+    fn a_verify_that_ran_no_flow_says_so_in_its_own_words() {
+        let invocation = ran(
+            Landing::Passed,
+            r#"{"ok":false,"status":"nothing_verified","skipped":true,"flows":0,"reason":"no flow files were found"}"#,
+        );
+        let (structured, text) = absorbed(&invocation);
+        assert_eq!(structured["status"], "nothing_verified");
+        assert!(text.contains("No flow was replayed"), "{text}");
+        assert!(!text.contains("The UI was exercised"), "{text}");
+    }
+
+    #[test]
+    fn a_real_failure_is_never_softened_into_nothing_verified() {
+        let invocation = ran(
+            Landing::Failed,
+            r#"{"ok":false,"status":"nothing_verified","verdict":"fail","steps_failed":1}"#,
+        );
+        let (structured, _) = absorbed(&invocation);
+        assert_eq!(structured["ok"], false);
+        assert_eq!(
+            structured["status"], "ui_test_failed",
+            "an exit 1 is the UI failing, whatever the summary says about proving nothing"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_pass_stays_a_pass() {
+        let invocation = ran(
+            Landing::Passed,
+            r#"{"ok":true,"verdict":"pass","steps_failed":0,"steps_total":3}"#,
+        );
+        let (structured, text) = absorbed(&invocation);
+        assert_eq!(structured["ok"], true);
+        assert_eq!(structured["status"], "passed");
+        assert!(!text.contains("NOT A PASS"), "{text}");
+    }
+
+    #[test]
+    fn a_verdict_this_build_cannot_read_is_not_guessed_at() {
+        let invocation = ran(
+            Landing::Passed,
+            r#"{"ok":true,"verdict":"probably_fine","steps_failed":0}"#,
+        );
+        let (structured, text) = absorbed(&invocation);
+        assert_eq!(structured["ok"], false, "{text}");
+        assert_eq!(structured["status"], "nothing_verified");
+        assert!(text.contains("UNRECOGNISED VERDICT"), "{text}");
+        assert!(text.contains("probably_fine"), "{text}");
+    }
+
+    #[test]
+    fn every_verdict_the_cli_emits_is_one_this_build_knows() {
+        for verdict in ["pass", "fail", "error", "nothing_verified"] {
+            let invocation = ran(
+                Landing::Passed,
+                &format!(r#"{{"ok":true,"verdict":"{verdict}"}}"#),
+            );
+            let (structured, _) = absorbed(&invocation);
+            assert_ne!(
+                structured["status"], "nothing_verified",
+                "{verdict} must not trip the unrecognised-verdict guard"
+            );
+        }
     }
 }

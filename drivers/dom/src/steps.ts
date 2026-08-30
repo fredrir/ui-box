@@ -23,6 +23,8 @@ const KEY_ALIASES: Record<string, StepKind> = {
   assertText: "assert_text",
   assert_absent: "assert_absent",
   assertAbsent: "assert_absent",
+  assert_visible: "assert_visible",
+  assertVisible: "assert_visible",
   snap: "snap",
   screenshot: "snap",
 };
@@ -90,6 +92,7 @@ function actionBody(kind: StepKind, record: Record<string, unknown>): unknown {
     case "click":
     case "wait_for":
     case "assert_absent":
+    case "assert_visible":
       return record.selector ?? record.value;
     case "type":
       return {
@@ -105,7 +108,7 @@ function actionBody(kind: StepKind, record: Record<string, unknown>): unknown {
         ? { selector: record.selector, text: record.text }
         : (record.selector ?? record.value ?? record.text);
     case "snap":
-      return { name: record.name, mode: record.mode };
+      return { name: record.name, mode: record.mode, clip: record.clip };
     default:
       return record.value;
   }
@@ -128,6 +131,10 @@ function build(kind: StepKind, body: unknown, timeoutMs: number | null): StepPla
     case "assert_absent": {
       const selector = asSelectorString(body, "assert_absent");
       return { kind, step: { assert_absent: selector }, timeoutMs, selector };
+    }
+    case "assert_visible": {
+      const selector = asSelectorString(body, "assert_visible");
+      return { kind, step: { assert_visible: selector }, timeoutMs, selector };
     }
     case "key": {
       const key = asString(body, "key");
@@ -175,7 +182,11 @@ function build(kind: StepKind, body: unknown, timeoutMs: number | null): StepPla
       const name =
         typeof body === "string" ? body : typeof record.name === "string" ? record.name : "";
       const mode = normalizeMode(record.mode);
-      return { kind, step: { snap: { name, mode } }, timeoutMs, selector: null };
+      const step: NormalizedStep = { snap: { name, mode } };
+      if (typeof record.clip === "string" && record.clip.trim().length > 0) {
+        step.snap.clip = record.clip.trim();
+      }
+      return { kind, step, timeoutMs, selector: null };
     }
     default:
       throw unknownStep(kind);
@@ -210,7 +221,7 @@ function asSelectorString(body: unknown, label: string): string {
 function unknownStep(key: string): DriverError {
   return new DriverError(
     "step",
-    `unknown step "${key}"; supported: open, click, type, key, wait_for, assert_text, assert_absent, snap`,
+    `unknown step "${key}"; supported: open, click, type, key, wait_for, assert_text, assert_absent, assert_visible, snap`,
     RPC_INVALID_PARAMS,
   );
 }

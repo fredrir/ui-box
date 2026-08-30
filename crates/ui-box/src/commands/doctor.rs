@@ -303,9 +303,18 @@ fn resolved_paths(tauri: &TauriInfo) -> String {
     if parts.is_empty() {
         parts.push("usable, paths not reported".to_string());
     }
-    match tauri.source.as_ref().and_then(describe_source) {
+    let resolved = match tauri.source.as_ref().and_then(describe_source) {
         Some(source) => format!("{} (from {source})", parts.join(", ")),
         None => parts.join(", "),
+    };
+    match tauri
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    {
+        Some(reason) => format!("{resolved}; {reason}"),
+        None => resolved,
     }
 }
 
@@ -712,6 +721,36 @@ mod tests {
         assert!(check.detail.contains("/nix/store/aaa/bin/tauri-driver"));
         assert!(check.detail.contains("/nix/store/bbb/bin/WebKitWebDriver"));
         assert!(check.detail.contains("PATH"));
+    }
+
+    #[test]
+    fn a_passing_tauri_check_still_carries_the_drivers_scope_statement() {
+        let check = check_tauri(
+            &config_for(None),
+            Some(&info_with(Some(TauriInfo {
+                ok: true,
+                tauri_driver: Some("/nix/store/aaa/bin/tauri-driver".to_string()),
+                native_driver: None,
+                source: Some(json!({"tauriDriver": "env", "nativeDriver": "unset"})),
+                reason: Some(
+                    "no native driver override, which is the expected case: tauri-driver \
+                     resolves WebKitWebDriver itself"
+                        .to_string(),
+                ),
+            }))),
+        );
+        assert!(check.ok);
+        assert!(
+            check.detail.contains("which is the expected case"),
+            "an unset native driver reads as a caveat unless the driver's own words \
+             explain it: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("nativeDriver=unset"),
+            "{}",
+            check.detail
+        );
     }
 
     #[test]

@@ -15,12 +15,18 @@ import {
   envString,
 } from "../config.js";
 import { DriverError, RPC_ATTACH_FAILED } from "../errors.js";
-import type { ReadinessReport, RuntimeConfig, SnapshotConfig } from "../injected/runtime.js";
+import type {
+  EvalDescriptor,
+  ReadinessReport,
+  RuntimeConfig,
+  SnapshotConfig,
+  VisibilityReport,
+} from "../injected/runtime.js";
 import { uiboxRuntime } from "../injected/runtime.js";
 import { EventRecorder, nowIso } from "../recorder.js";
 import type { ParsedSelector, TextMatch } from "../selector.js";
 import type { DrainedEvents, OpenOptions, Surface, Viewport } from "../types.js";
-import { type Backend, type FillOptions, toRuntimeSpec } from "./index.js";
+import { type Backend, type FillOptions, callExpression, toRuntimeSpec } from "./index.js";
 
 const BROWSERS = { chromium, firefox, webkit };
 
@@ -180,6 +186,21 @@ export class PlaywrightBackend implements Backend {
 
   async evaluate(expr: string): Promise<unknown> {
     return this.page.evaluate(expr);
+  }
+
+  async evalDescribe(expr: string): Promise<EvalDescriptor> {
+    await this.ensureRuntime();
+    return this.page.evaluate(
+      `window.__uibox.describeValue(${callExpression(expr)})`,
+    ) as Promise<EvalDescriptor>;
+  }
+
+  async describeElement(selector: ParsedSelector): Promise<VisibilityReport> {
+    await this.ensureRuntime();
+    return this.page.evaluate(
+      (spec) => window.__uibox!.describeElement(spec),
+      toRuntimeSpec(selector),
+    );
   }
 
   async snapshotText(config: SnapshotConfig): Promise<string> {

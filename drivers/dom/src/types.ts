@@ -12,6 +12,7 @@ export interface ConsoleEntry {
   type: "error" | "warning" | "log" | "pageerror";
   text: string;
   location?: string;
+  benign?: boolean;
 }
 
 export interface NetworkEntry {
@@ -70,6 +71,9 @@ export interface OpenOptions {
   maxTreeLines?: number;
   requireReady?: boolean;
   captureConsole?: "errors" | "all";
+  clipPadding?: number;
+  clipMinSide?: number;
+  benignConsole?: string[];
 }
 
 export interface OpenParams {
@@ -89,6 +93,16 @@ export interface TypeStepBody {
 export interface SnapStepBody {
   name: string;
   mode: SnapMode;
+  clip?: string;
+}
+
+export interface ClipReport {
+  selector: string;
+  rect: { x: number; y: number; width: number; height: number };
+  padding: number;
+  scale: number;
+  upscale: number;
+  pixel?: string;
 }
 
 export interface AssertTextStepBody {
@@ -104,6 +118,7 @@ export type NormalizedStep =
   | { wait_for: string }
   | { assert_text: string | AssertTextStepBody }
   | { assert_absent: string }
+  | { assert_visible: string }
   | { snap: SnapStepBody };
 
 export type StepKind =
@@ -114,6 +129,7 @@ export type StepKind =
   | "wait_for"
   | "assert_text"
   | "assert_absent"
+  | "assert_visible"
   | "snap";
 
 export interface ActParams {
@@ -136,12 +152,17 @@ export interface ActResult {
   durationMs: number;
   url?: string;
   snap?: SnapResult;
+  report?: Record<string, unknown>;
 }
 
 export interface SnapParams {
   sessionId: string;
   mode?: SnapMode;
   name?: string;
+  clip?: string;
+  clipPadding?: number;
+  clipMinSide?: number;
+  benignConsole?: string[];
 }
 
 export interface SnapResult {
@@ -153,6 +174,7 @@ export interface SnapResult {
   console: ConsoleEntry[];
   network: NetworkEntry[];
   url?: string;
+  clip?: ClipReport;
 }
 
 export interface EvalParams {

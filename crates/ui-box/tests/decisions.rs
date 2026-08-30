@@ -40,9 +40,16 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     result = { sessionId: s };
   } else if (verb === 'act') {
     const step = req.params.step || {};
-    result = step.click === 'css=#fail'
-      ? { ok: false, error: 'no element matches css=#fail' }
-      : { ok: true };
+    if (step.click === 'css=#fail') {
+      result = { ok: false, error: 'no element matches css=#fail' };
+    } else if (step.assert_absent === 'css=#blank') {
+      result = { ok: false, error: { kind: 'nothing_verified',
+        message: 'matched nothing, but the page is not rendered, so its absence proves nothing' } };
+    } else if (step.assert_absent === 'css=#present') {
+      result = { ok: false, error: { kind: 'assertion', message: 'still visible' } };
+    } else {
+      result = { ok: true };
+    }
   } else if (verb === 'snap') {
     const dir = dirs.get(req.params.sessionId);
     fs.mkdirSync(dir, { recursive: true });
@@ -443,4 +450,80 @@ fn a_verify_that_replayed_nothing_is_not_reported_as_a_pass() {
     assert_eq!(body["status"], "nothing_verified");
     assert_eq!(body["skipped"], true);
     assert_eq!(body["flows"], 0);
+}
+
+const ABSENCE_ON_A_BLANK_PAGE: &str =
+    "version: 1\nflow: absent\nsurface: web\ntarget: http://x/\nsteps:\n  \
+     - assert_absent: \"css=#blank\"\n";
+
+const ABSENCE_THAT_IS_STILL_THERE: &str =
+    "version: 1\nflow: absent\nsurface: web\ntarget: http://x/\nsteps:\n  \
+     - assert_absent: \"css=#present\"\n";
+
+#[test]
+fn an_assertion_that_proved_nothing_is_not_reported_as_the_ui_failing() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("proved-nothing");
+    let path = flow(&dir, ABSENCE_ON_A_BLANK_PAGE);
+    let output = ui_box(&dir, &["run", &path]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a page that never rendered is not the application failing"
+    );
+    let body = summary(&output);
+    assert_eq!(body["ok"], false, "and it is not a pass either");
+    assert_eq!(body["status"], "nothing_verified");
+    assert_eq!(body["verdict"], "nothing_verified");
+    assert_eq!(body["steps_failed"], 0);
+    assert_eq!(body["steps_nothing"], 1);
+}
+
+#[test]
+fn a_real_assertion_failure_is_not_softened_into_nothing_verified() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("still-there");
+    let path = flow(&dir, ABSENCE_THAT_IS_STILL_THERE);
+    let output = ui_box(&dir, &["run", &path]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the element is still there, which is the UI failing"
+    );
+    let body = summary(&output);
+    assert_eq!(body["verdict"], "fail");
+    assert_eq!(body["steps_failed"], 1);
+    assert_eq!(body["steps_nothing"], 0);
+}
+
+#[test]
+fn a_live_step_that_proved_nothing_says_so_without_blaming_the_page() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("act-nothing");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+
+    let output = ui_box(&dir, &["act", &session, "assert_absent", "css=#blank"]);
+    assert_eq!(output.status.code(), Some(0));
+    let body = summary(&output);
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["status"], "nothing_verified");
+    assert_eq!(body["error_kind"], "nothing_verified");
+
+    let failed = summary(&ui_box(
+        &dir,
+        &["act", &session, "assert_absent", "css=#present"],
+    ));
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["error_kind"], "assertion");
+
+    ui_box(&dir, &["close", &session]);
 }

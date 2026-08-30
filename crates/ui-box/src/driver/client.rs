@@ -63,9 +63,21 @@ pub struct ActResult {
     pub ok: bool,
     #[serde(default)]
     pub error: Option<Value>,
+    #[serde(default)]
+    pub report: Option<Value>,
 }
 
+pub const NOTHING_VERIFIED: &str = "nothing_verified";
+
 impl ActResult {
+    pub fn error_kind(&self) -> Option<&str> {
+        self.error.as_ref()?.get("kind").and_then(Value::as_str)
+    }
+
+    pub fn verified_nothing(&self) -> bool {
+        self.error_kind() == Some(NOTHING_VERIFIED)
+    }
+
     pub fn error_text(&self) -> Option<String> {
         let error = self.error.as_ref()?;
         if error.is_null() {
@@ -102,6 +114,26 @@ pub struct SnapResult {
     pub console: Vec<Value>,
     #[serde(default)]
     pub network: Vec<Value>,
+    #[serde(default)]
+    pub clip: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EvalResult {
+    #[serde(default)]
+    pub value: Value,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub serializable: Option<bool>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl EvalResult {
+    pub fn carried_nothing(&self) -> bool {
+        self.serializable == Some(false)
+    }
 }
 
 const STDERR_TAIL_LINES: usize = 20;
@@ -385,8 +417,18 @@ impl Connection {
     }
 
     pub fn eval(&mut self, session: &str, expr: &str) -> Result<Value> {
-        let value = self.call("eval", json!({ "sessionId": session, "expr": expr }))?;
-        Ok(value.get("value").cloned().unwrap_or(value))
+        Ok(self.eval_result(session, expr)?.value)
+    }
+
+    pub fn eval_result(&mut self, session: &str, expr: &str) -> Result<EvalResult> {
+        let raw = self.call("eval", json!({ "sessionId": session, "expr": expr }))?;
+        if raw.get("value").is_none() {
+            return Ok(EvalResult {
+                value: raw,
+                ..EvalResult::default()
+            });
+        }
+        serde_json::from_value(raw).context("driver eval is not {value, kind, serializable}")
     }
 
     pub fn close(&mut self, session: &str) -> Result<()> {
@@ -533,6 +575,89 @@ mod tests {
 
     fn info(raw: &str) -> DriverInfo {
         serde_json::from_str(raw).expect("driver info")
+    }
+
+    fn act(raw: &str) -> ActResult {
+        serde_json::from_str(raw).expect("act result")
+    }
+
+    #[test]
+    fn a_step_that_verified_nothing_is_not_an_ordinary_assertion_failure() {
+        let result = act(r#"{"ok":false,"error":{"kind":"nothing_verified",
+                "message":"assert_absent matched nothing, and the page is not rendered"}}"#);
+        assert!(!result.ok);
+        assert!(result.verified_nothing());
+        assert_eq!(result.error_kind(), Some(NOTHING_VERIFIED));
+    }
+
+    #[test]
+    fn an_element_that_is_still_there_stays_an_assertion_failure() {
+        let result = act(r#"{"ok":false,"error":{"kind":"assertion","message":"still visible"}}"#);
+        assert!(!result.ok);
+        assert!(
+            !result.verified_nothing(),
+            "a real assertion failure must not be softened into nothing_verified"
+        );
+        assert_eq!(result.error_kind(), Some("assertion"));
+    }
+
+    #[test]
+    fn a_driver_that_names_no_kind_claims_nothing_about_one() {
+        assert_eq!(act(r#"{"ok":true}"#).error_kind(), None);
+        assert_eq!(
+            act(r#"{"ok":false,"error":"plain text failure"}"#).error_kind(),
+            None
+        );
+        assert!(!act(r#"{"ok":false,"error":"plain text failure"}"#).verified_nothing());
+    }
+
+    fn eval_of(raw: &str) -> EvalResult {
+        serde_json::from_str(raw).expect("eval result")
+    }
+
+    #[test]
+    fn a_value_the_driver_could_not_carry_is_not_a_null_result() {
+        let undefined = eval_of(r#"{"value":null,"kind":"undefined","serializable":false}"#);
+        assert!(undefined.carried_nothing());
+        let real_null = eval_of(r#"{"value":null,"kind":"null","serializable":true}"#);
+        assert!(
+            !real_null.carried_nothing(),
+            "a genuine null is a result, not an absence"
+        );
+    }
+
+    #[test]
+    fn a_driver_that_does_not_report_serializability_claims_nothing_about_it() {
+        let old = eval_of(r#"{"value":null}"#);
+        assert_eq!(old.serializable, None);
+        assert!(
+            !old.carried_nothing(),
+            "silence must not be read as `could not carry it`"
+        );
+    }
+
+    #[test]
+    fn a_snap_carries_its_clip_and_an_act_its_report_verbatim() {
+        let snap: SnapResult = serde_json::from_str(
+            r##"{"name":"x","console":[],"network":[],
+                "clip":{"selector":"css=#a","rect":{"x":1,"y":2,"width":3,"height":4},
+                        "pixel":"#ff0000"}}"##,
+        )
+        .expect("snap");
+        assert_eq!(snap.clip.as_ref().unwrap()["pixel"], "#ff0000");
+
+        let act = act(r#"{"ok":true,"report":{"visible":true,"matches":2}}"#);
+        assert_eq!(act.report.as_ref().unwrap()["matches"], 2);
+    }
+
+    #[test]
+    fn a_shape_ui_box_has_no_field_for_never_costs_it_the_result() {
+        let snap: SnapResult =
+            serde_json::from_str(r#"{"name":"x","console":[{"benign":true,"text":"boom"}]}"#)
+                .expect("snap");
+        assert_eq!(snap.console[0]["benign"], true);
+        let act = act(r#"{"ok":true,"somethingAddedLater":{"deeply":["nested"]}}"#);
+        assert!(act.ok);
     }
 
     fn shim(script: &str) -> DriverSpec {

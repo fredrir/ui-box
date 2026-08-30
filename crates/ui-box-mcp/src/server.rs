@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::diagnostics::{self, Cursor, Events, DEFAULT_MAX_CHARS};
-use crate::outcome::{Domain, Report, BLANK_BANNER};
+use crate::outcome::{self, Domain, Report, BLANK_BANNER};
 use crate::schema;
 use crate::uibox::{Invocation, Landing, UiBox};
 
@@ -388,7 +388,12 @@ impl UiBoxServer {
             let detail = invocation
                 .error_message()
                 .unwrap_or_else(|| "no reason given".to_string());
-            landed.push(format!("fail {label}: {detail}"));
+            let marker = if proved_nothing(&invocation) {
+                "none"
+            } else {
+                "fail"
+            };
+            landed.push(format!("{marker} {label}: {detail}"));
             failure = Some(invocation);
             break;
         }
@@ -409,9 +414,14 @@ impl UiBoxServer {
         };
 
         report.headline(format!(
-            "step {} of {} failed on session {}.",
+            "step {} of {} {} on session {}.",
             landed.len(),
             steps.len(),
+            if proved_nothing(&invocation) {
+                "proved nothing"
+            } else {
+                "failed"
+            },
             args.session
         ));
         report.absorb(&invocation);
@@ -621,8 +631,10 @@ impl UiBoxServer {
                 "target",
                 "backend",
                 "verdict",
+                "status",
                 "steps_total",
                 "steps_failed",
+                "steps_nothing",
                 "halted_at",
                 "placed",
                 "goldens",
@@ -727,9 +739,11 @@ impl UiBoxServer {
                 "flows",
                 "failed",
                 "verdict",
+                "status",
                 "skipped",
                 "reason",
                 "looked_in",
+                "nothing_verified",
             ],
         );
 
@@ -1144,6 +1158,10 @@ fn push_option(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
     }
 }
 
+fn proved_nothing(invocation: &Invocation) -> bool {
+    invocation.text("status").as_deref() == Some(outcome::NOTHING_STATUS)
+}
+
 fn facts_pick(report: &mut Report, summary: &Value, keys: &[&str]) {
     for key in keys {
         if let Some(value) = summary.get(*key) {
@@ -1423,4 +1441,44 @@ fn build_step(
         }
     };
     Ok(step)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acted(summary: &str) -> Invocation {
+        Invocation {
+            argv: vec!["act".to_string()],
+            landing: Landing::Passed,
+            stdout: format!("{summary}\n"),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_step_that_proved_nothing_is_not_labelled_a_failure() {
+        let nothing = acted(r#"{"ok":false,"status":"nothing_verified","step_ok":false}"#);
+        assert!(proved_nothing(&nothing));
+
+        let failure = acted(r#"{"ok":false,"status":"failed","step_ok":false}"#);
+        assert!(
+            !proved_nothing(&failure),
+            "a real step failure must keep saying it failed"
+        );
+
+        let passed = acted(r#"{"ok":true,"status":"passed","step_ok":true}"#);
+        assert!(!proved_nothing(&passed));
+    }
+
+    #[test]
+    fn a_summary_without_a_status_claims_nothing_about_one() {
+        assert!(!proved_nothing(&acted(r#"{"ok":true}"#)));
+        assert!(!proved_nothing(&Invocation {
+            argv: vec!["act".to_string()],
+            landing: Landing::Passed,
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+    }
 }

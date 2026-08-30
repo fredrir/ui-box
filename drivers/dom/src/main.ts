@@ -17,6 +17,8 @@ import type {
 
 const DRIVER_NAME = "dom";
 const SURFACES = ["web", "tauri"] as const;
+const NATIVE_DRIVER_DELEGATED =
+  "no native driver override, which is the expected case: tauri-driver resolves WebKitWebDriver itself";
 const NO_OVERRIDE_SCOPE =
   "resolved on the driver host from UIBOX_TAURI_DRIVER, UIBOX_NATIVE_DRIVER and PATH, with no per-session overrides";
 
@@ -135,12 +137,13 @@ function tauriCapability(): Record<string, unknown> {
   const bins = resolveTauriBins({});
   const probe = probeTauriBins(bins);
   const faults = [probe.reason, displayFault()].filter((fault) => fault !== null);
+  const notes = bins.source.nativeDriver === "unset" ? [NATIVE_DRIVER_DELEGATED] : [];
   return {
     ok: faults.length === 0,
     tauriDriver: probe.tauriDriver,
     nativeDriver: probe.nativeDriver,
     source: bins.source,
-    reason: [...faults, NO_OVERRIDE_SCOPE].join("; "),
+    reason: [...faults, ...notes, NO_OVERRIDE_SCOPE].join("; "),
   };
 }
 
@@ -171,12 +174,22 @@ async function snapSession(registry: SessionRegistry, params: SnapParams): Promi
   if (mode !== "text" && mode !== "png" && mode !== "both" && mode !== "layout") {
     throw new DriverError("params", `invalid snap mode "${String(mode)}"`, RPC_INVALID_PARAMS);
   }
-  return session.snap(mode, params?.name);
+  return session.snap(mode, params?.name, {
+    selector: typeof params?.clip === "string" ? params.clip : undefined,
+    padding: params?.clipPadding,
+    minSide: params?.clipMinSide,
+  });
 }
 
 async function evalSession(registry: SessionRegistry, params: EvalParams): Promise<unknown> {
   const session = registry.get(params?.sessionId);
-  return { value: await session.evaluate(params?.expr) };
+  const described = await session.evaluate(params?.expr);
+  return {
+    value: described.serializable && described.json !== null ? JSON.parse(described.json) : null,
+    kind: described.kind,
+    serializable: described.serializable,
+    ...(described.detail ? { detail: described.detail } : {}),
+  };
 }
 
 async function closeSession(registry: SessionRegistry, params: CloseParams): Promise<unknown> {

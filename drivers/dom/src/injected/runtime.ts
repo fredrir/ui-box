@@ -48,6 +48,32 @@ export interface RuntimeDrain {
   network: RuntimeNetworkEntry[];
 }
 
+export interface ElementRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface VisibilityReport {
+  matches: number;
+  rect: ElementRect | null;
+  viewport: { width: number; height: number };
+  devicePixelRatio: number;
+  visible: boolean;
+  hitTest: "self" | "descendant" | "other" | "outside" | "none";
+  reasons: string[];
+  styles: { display: string; visibility: string; opacity: string; backgroundColor: string };
+}
+
+export interface EvalDescriptor {
+  kind: string;
+  serializable: boolean;
+  json: string | null;
+  threw: boolean;
+  detail: string | null;
+}
+
 export interface RuntimeSelectorSpec {
   kind: "css" | "role" | "text";
   value?: string;
@@ -71,6 +97,8 @@ export interface UiboxRuntimeApi {
   readiness(): ReadinessReport;
   mark(spec: RuntimeSelectorSpec, token: string): number;
   labelProxy(el: Element, token: string): boolean;
+  describeElement(spec: RuntimeSelectorSpec): VisibilityReport;
+  describeValue(value: unknown): EvalDescriptor;
   clearMarks(token: string): void;
   textOf(spec: RuntimeSelectorSpec, limit: number): string[];
   drain(): RuntimeDrain;
@@ -475,6 +503,168 @@ export function uiboxRuntime(config: RuntimeConfig): void {
     return out;
   }
 
+  function isOpaqueColor(color: string): boolean {
+    if (!color || color === "transparent") return false;
+    const match = /^rgba?\(([^)]+)\)$/.exec(color);
+    if (!match) return true;
+    const parts = match[1]!.split(",");
+    if (parts.length < 4) return true;
+    return Number(parts[3]) > 0;
+  }
+
+  function paintSummary(style: CSSStyleDeclaration): string {
+    if (isOpaqueColor(style.backgroundColor)) return style.backgroundColor;
+    if (style.backgroundImage && style.backgroundImage !== "none") return "background-image";
+    const borders = [
+      style.borderTopWidth,
+      style.borderRightWidth,
+      style.borderBottomWidth,
+      style.borderLeftWidth,
+    ];
+    if (borders.some((width) => width !== "0px" && width !== "")) return "border";
+    return "";
+  }
+
+  function paintedDecoration(el: Element): string {
+    const style = window.getComputedStyle(el);
+    if (style.display === "none") return "";
+    if (style.visibility === "hidden" || style.visibility === "collapse") return "";
+    if (style.opacity === "0") return "";
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return "";
+    return paintSummary(style);
+  }
+
+  function clippingAncestor(el: Element, rect: DOMRect): Element | null {
+    let current = el.parentElement;
+    while (current) {
+      const style = window.getComputedStyle(current);
+      const overflow = `${style.overflowX} ${style.overflowY}`;
+      if (overflow.indexOf("visible") === -1 && overflow !== "") {
+        const bounds = current.getBoundingClientRect();
+        if (
+          rect.right <= bounds.left ||
+          rect.left >= bounds.right ||
+          rect.bottom <= bounds.top ||
+          rect.top >= bounds.bottom
+        ) {
+          return current;
+        }
+      }
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  function hitTestOf(el: Element, rect: DOMRect): VisibilityReport["hitTest"] {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= vh || rect.left >= vw) return "outside";
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 0), vw - 1);
+    const y = Math.min(Math.max(rect.top + rect.height / 2, 0), vh - 1);
+    const top = document.elementFromPoint(x, y);
+    if (!top) return "none";
+    if (top === el) return "self";
+    if (el.contains(top)) return "descendant";
+    return "other";
+  }
+
+  function describeElement(spec: RuntimeSelectorSpec): VisibilityReport {
+    const matches = retarget(
+      resolve({ ...spec, options: { ...spec.options, includeHidden: true } }),
+    );
+    const viewport = { width: window.innerWidth, height: window.innerHeight };
+    const report: VisibilityReport = {
+      matches: matches.length,
+      rect: null,
+      viewport,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      visible: false,
+      hitTest: "none",
+      reasons: [],
+      styles: { display: "", visibility: "", opacity: "", backgroundColor: "" },
+    };
+    const el = matches[0];
+    if (!el) {
+      report.reasons.push("no element matched");
+      return report;
+    }
+    if (matches.length > 1) report.reasons.push(`${matches.length} elements matched`);
+
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    report.rect = {
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+    report.styles = {
+      display: style.display,
+      visibility: style.visibility,
+      opacity: style.opacity,
+      backgroundColor: style.backgroundColor,
+    };
+    report.hitTest = hitTestOf(el, rect);
+
+    if (rect.width < 1 || rect.height < 1) report.reasons.push("zero-size box");
+    if (style.display === "none") report.reasons.push("display:none");
+    if (style.visibility === "hidden" || style.visibility === "collapse") {
+      report.reasons.push(`visibility:${style.visibility}`);
+    }
+    if (style.opacity === "0") report.reasons.push("opacity:0");
+    if (report.hitTest === "outside") report.reasons.push("outside the viewport");
+    if (report.hitTest === "other") report.reasons.push("another element is on top");
+    const clipper = clippingAncestor(el, rect);
+    if (clipper) report.reasons.push(`clipped by an ancestor <${clipper.tagName.toLowerCase()}>`);
+
+    report.visible = report.reasons.length === 0;
+    return report;
+  }
+
+  function describeValue(value: unknown): EvalDescriptor {
+    if (value === undefined) {
+      return { kind: "undefined", serializable: false, json: null, threw: false, detail: null };
+    }
+    if (value === null) {
+      return { kind: "null", serializable: true, json: "null", threw: false, detail: null };
+    }
+    const kind = typeof value;
+    if (kind === "function" || kind === "symbol" || kind === "bigint") {
+      return {
+        kind,
+        serializable: false,
+        json: null,
+        threw: false,
+        detail: String(value).slice(0, 200),
+      };
+    }
+    if (kind === "object" && typeof (value as { then?: unknown }).then === "function") {
+      return {
+        kind: "promise",
+        serializable: false,
+        json: null,
+        threw: false,
+        detail: "the expression returned a promise and the driver evaluates synchronously",
+      };
+    }
+    try {
+      const json = JSON.stringify(value);
+      if (json === undefined) {
+        return { kind, serializable: false, json: null, threw: false, detail: null };
+      }
+      return { kind, serializable: true, json, threw: false, detail: null };
+    } catch (err) {
+      return {
+        kind,
+        serializable: false,
+        json: null,
+        threw: false,
+        detail: String((err as Error).message).slice(0, 200),
+      };
+    }
+  }
+
   function snapshot(snapConfig: SnapshotConfig): string {
     const maxLines = snapConfig.maxLines > 0 ? snapConfig.maxLines : 1200;
     const maxTextLength = snapConfig.maxTextLength > 0 ? snapConfig.maxTextLength : 160;
@@ -554,7 +744,23 @@ export function uiboxRuntime(config: RuntimeConfig): void {
 
       const el = node as Element;
       if (SKIP_TAGS[el.tagName]) return [];
-      if (!includeHidden && isHidden(el)) return [];
+      if (!includeHidden && isHidden(el)) {
+        if (!withLayout) return [];
+        const paint = paintedDecoration(el);
+        if (!paint) return [];
+        budget -= 1;
+        return [
+          {
+            kind: "element",
+            role: "decoration",
+            name: paint,
+            attrs: [],
+            value: null,
+            layout: layoutOf(el),
+            children: [],
+          },
+        ];
+      }
       if (el.tagName === "LABEL" && labelTextIsConsumed(el)) return collectChildren(el, true);
 
       const role = roleOf(el);
@@ -956,6 +1162,8 @@ export function uiboxRuntime(config: RuntimeConfig): void {
       for (let i = 0; i < matches.length; i += 1) matches[i]!.setAttribute("data-uibox-hit", token);
       return matches.length;
     },
+    describeElement,
+    describeValue,
     labelProxy(el: Element, token: string): boolean {
       const target = interactionTarget(el);
       if (target === el) return false;

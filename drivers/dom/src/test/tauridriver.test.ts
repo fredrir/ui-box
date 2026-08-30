@@ -5,10 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { findExecutable, probeTauriBins, resolveTauriBins } from "../backend/webdriver.js";
+import { pngDimensions, samplePixel } from "../image.js";
 import { normalizeStep } from "../steps.js";
 import { W3C_ELEMENT_KEY } from "../webdriver/client.js";
 import { DriverClient } from "./rpcclient.js";
-import { type FakeWebDriver, PROTOCOL_ELEMENT_KEY, startFakeWebDriver } from "./webdriverfake.js";
+import {
+  ACCENT_COLOR,
+  ACCENT_RECT,
+  type FakeWebDriver,
+  PROTOCOL_ELEMENT_KEY,
+  startFakeWebDriver,
+} from "./webdriverfake.js";
 
 const MISSING_BIN = "/nonexistent/uibox-tauri-driver";
 
@@ -215,7 +222,26 @@ describe("driver.info tauri capability", { timeout: 60_000 }, () => {
       assert.deepEqual(info.tauri.source, { tauriDriver: "default", nativeDriver: "unset" });
       assert.equal(info.tauri.nativeDriver, null);
       assert.match(info.tauri.reason, /no per-session overrides/);
+      assert.match(info.tauri.reason, /tauri-driver resolves WebKitWebDriver itself/);
       if (!info.tauri.ok) assert.match(info.tauri.reason, /tauri-driver/);
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  test("an explicit native driver override drops the delegation note", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "uibox-both-"));
+    const tauri = await writeScript(dir, "tauri-driver", "#!/bin/sh\nexit 0\n");
+    const native = await writeScript(dir, "WebKitWebDriver", "#!/bin/sh\nexit 0\n");
+    const client = new DriverClient({
+      UIBOX_TAURI_DRIVER: tauri,
+      UIBOX_NATIVE_DRIVER: native,
+    });
+    try {
+      const info = await client.call("driver.info");
+      assert.deepEqual(info.tauri.source, { tauriDriver: "env", nativeDriver: "env" });
+      assert.equal(info.tauri.nativeDriver, native);
+      assert.doesNotMatch(info.tauri.reason, /the expected case/);
     } finally {
       await client.dispose();
     }
@@ -231,7 +257,7 @@ describe("driver.info tauri capability", { timeout: 60_000 }, () => {
       assert.equal(info.tauri.tauriDriver, script);
       assert.equal(info.tauri.nativeDriver, null);
       assert.deepEqual(info.tauri.source, { tauriDriver: "env", nativeDriver: "unset" });
-      assert.match(info.tauri.reason, /no per-session overrides/);
+      assert.match(info.tauri.reason, /the expected case/);
     } finally {
       await client.dispose();
     }
@@ -349,5 +375,264 @@ describe("absence and layout over the driver protocol", { timeout: 60_000 }, () 
   test("driver.info advertises the layout mode", async () => {
     const info = await client.call("driver.info");
     assert.deepEqual(info.modes, ["text", "png", "both", "layout"]);
+  });
+});
+
+describe("clip, visibility and eval over the driver protocol", { timeout: 60_000 }, () => {
+  let fake: FakeWebDriver;
+  let client: DriverClient;
+  let runDir: string;
+  let sessionId: string;
+
+  before(async () => {
+    fake = await startFakeWebDriver();
+    runDir = await mkdtemp(join(tmpdir(), "uibox-clip-"));
+    client = new DriverClient({ UIBOX_RUN_DIR: runDir });
+    const opened = await client.call("driver.open", {
+      target: "exec:/opt/lab",
+      options: { webdriverUrl: fake.url },
+    });
+    sessionId = opened.sessionId;
+  });
+
+  after(async () => {
+    await client.dispose();
+    await fake.close();
+  });
+
+  test("a clipped png lands on the element, proven by the pixels inside it", async () => {
+    const snap = await client.call("driver.snap", {
+      sessionId,
+      mode: "png",
+      name: "accent",
+      clip: "css=.accent",
+      clipPadding: 0,
+      clipMinSide: 1,
+    });
+    assert.deepEqual(snap.clip.rect, ACCENT_RECT);
+    assert.equal(snap.clip.selector, "css=.accent");
+    assert.equal(snap.clip.scale, 1);
+    assert.equal(snap.clip.upscale, 1);
+
+    const png = await readFile(snap.pngPath);
+    assert.deepEqual(pngDimensions(png), { width: 2, height: 64 });
+    const expected = `#${ACCENT_COLOR.r.toString(16)}${ACCENT_COLOR.g.toString(16).padStart(2, "0")}${ACCENT_COLOR.b.toString(16)}`;
+    assert.equal(samplePixel(png, 0, 0), expected);
+    assert.equal(samplePixel(png, 1, 63), expected);
+    assert.equal(snap.clip.pixel, expected);
+  });
+
+  test("padding widens the crop and the report says by how much", async () => {
+    const snap = await client.call("driver.snap", {
+      sessionId,
+      mode: "png",
+      name: "accent-padded",
+      clip: "css=.accent",
+      clipPadding: 10,
+      clipMinSide: 1,
+    });
+    assert.equal(snap.clip.padding, 10);
+    assert.deepEqual(pngDimensions(await readFile(snap.pngPath)), { width: 22, height: 84 });
+  });
+
+  test("a 2px element is upscaled instead of being handed over unreadable", async () => {
+    const snap = await client.call("driver.snap", {
+      sessionId,
+      mode: "png",
+      name: "accent-upscaled",
+      clip: "css=.accent",
+      clipPadding: 0,
+    });
+    assert.equal(snap.clip.upscale, 32);
+    assert.deepEqual(pngDimensions(await readFile(snap.pngPath)), { width: 64, height: 2048 });
+  });
+
+  test("a clip selector that matches nothing is an error, never a lucky full frame", async () => {
+    fake.visibility = { ...fake.visibility, matches: 0, rect: null };
+    await assert.rejects(
+      () =>
+        client.call("driver.snap", {
+          sessionId,
+          mode: "png",
+          name: "missing-clip",
+          clip: "css=.nope",
+        }),
+      (err: any) => {
+        assert.match(err.message, /clip selector "css=\.nope" matched no element/);
+        assert.match(err.message, /nothing was cropped/);
+        return true;
+      },
+    );
+    fake.visibility = { ...fake.visibility, matches: 1, rect: { ...ACCENT_RECT } };
+  });
+
+  test("an ambiguous clip selector is refused rather than cropping one of them", async () => {
+    fake.visibility = { ...fake.visibility, matches: 3 };
+    await assert.rejects(
+      () =>
+        client.call("driver.snap", { sessionId, mode: "png", name: "ambiguous", clip: "css=div" }),
+      (err: any) => {
+        assert.match(err.message, /matched 3 elements/);
+        return true;
+      },
+    );
+    fake.visibility = { ...fake.visibility, matches: 1 };
+  });
+
+  test("assert_visible reports the rect, the hit test and the painted pixel", async () => {
+    const result = await client.call("driver.act", {
+      sessionId,
+      step: { assert_visible: "css=.accent" },
+    });
+    assert.equal(result.ok, true, JSON.stringify(result.error));
+    assert.equal(result.report.visible, true);
+    assert.deepEqual(result.report.rect, ACCENT_RECT);
+    assert.equal(result.report.hitTest, "self");
+    assert.equal(result.report.pixel, "#d64060");
+  });
+
+  test("assert_visible fails with the composite reason, not a bare timeout", async () => {
+    fake.visibility = {
+      ...fake.visibility,
+      visible: false,
+      hitTest: "other",
+      reasons: ["another element is on top", "clipped by an ancestor <div>"],
+    };
+    const result = await client.call("driver.act", {
+      sessionId,
+      step: { assert_visible: "css=.accent", timeout_ms: 200 },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.kind, "assertion");
+    assert.match(result.error.message, /another element is on top/);
+    assert.match(result.error.message, /clipped by an ancestor/);
+    assert.match(result.error.detail, /"pixel":"#d64060"/);
+    fake.visibility = defaultVisibleReport();
+  });
+
+  test("eval distinguishes a genuine null from a value it could not carry", async () => {
+    fake.evalDescriptor = {
+      kind: "null",
+      serializable: true,
+      json: "null",
+      threw: false,
+      detail: null,
+    };
+    const genuine = await client.call("driver.eval", { sessionId, expr: "null" });
+    assert.equal(genuine.value, null);
+    assert.equal(genuine.kind, "null");
+    assert.equal(genuine.serializable, true);
+
+    fake.evalDescriptor = {
+      kind: "undefined",
+      serializable: false,
+      json: null,
+      threw: false,
+      detail: null,
+    };
+    const absent = await client.call("driver.eval", { sessionId, expr: "window.nope" });
+    assert.equal(absent.value, null);
+    assert.equal(absent.kind, "undefined");
+    assert.equal(absent.serializable, false);
+
+    fake.evalDescriptor = {
+      kind: "promise",
+      serializable: false,
+      json: null,
+      threw: false,
+      detail: "the expression returned a promise and the driver evaluates synchronously",
+    };
+    const pending = await client.call("driver.eval", { sessionId, expr: "fetch('/x')" });
+    assert.equal(pending.kind, "promise");
+    assert.match(pending.detail, /synchronously/);
+
+    fake.evalDescriptor = {
+      kind: "object",
+      serializable: true,
+      json: '{"a":[1,2]}',
+      threw: false,
+      detail: null,
+    };
+    const object = await client.call("driver.eval", { sessionId, expr: "({a:[1,2]})" });
+    assert.deepEqual(object.value, { a: [1, 2] });
+  });
+});
+
+function defaultVisibleReport(): any {
+  return {
+    matches: 1,
+    rect: { ...ACCENT_RECT },
+    viewport: { width: 1280, height: 800 },
+    devicePixelRatio: 1,
+    visible: true,
+    hitTest: "self",
+    reasons: [],
+    styles: {
+      display: "block",
+      visibility: "visible",
+      opacity: "1",
+      backgroundColor: "rgb(214, 64, 96)",
+    },
+  };
+}
+
+describe("benign console errors", { timeout: 60_000 }, () => {
+  let fake: FakeWebDriver;
+
+  before(async () => {
+    fake = await startFakeWebDriver();
+  });
+
+  after(async () => {
+    await fake.close();
+  });
+
+  test("a declared-benign page error is marked, not dropped, and does not fail the step", async () => {
+    const client = new DriverClient();
+    try {
+      const opened = await client.call("driver.open", {
+        target: "exec:/opt/lab",
+        options: { webdriverUrl: fake.url, benignConsole: ["webkit console boom"] },
+      });
+      const snap = await client.call("driver.snap", { sessionId: opened.sessionId });
+      assert.equal(snap.console.length, 1);
+      assert.equal(snap.console[0].benign, true);
+      assert.equal(snap.console[0].text, "webkit console boom");
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  test("an undeclared error stays unmarked", async () => {
+    const client = new DriverClient();
+    try {
+      const opened = await client.call("driver.open", {
+        target: "exec:/opt/lab",
+        options: { webdriverUrl: fake.url, benignConsole: ["something else"] },
+      });
+      const snap = await client.call("driver.snap", { sessionId: opened.sessionId });
+      assert.equal(snap.console[0].benign, undefined);
+    } finally {
+      await client.dispose();
+    }
+  });
+
+  test("an invalid pattern is refused at open rather than silently ignored", async () => {
+    const client = new DriverClient();
+    try {
+      await assert.rejects(
+        () =>
+          client.call("driver.open", {
+            target: "exec:/opt/lab",
+            options: { webdriverUrl: fake.url, benignConsole: ["("] },
+          }),
+        (err: any) => {
+          assert.match(err.message, /invalid benignConsole pattern/);
+          return true;
+        },
+      );
+    } finally {
+      await client.dispose();
+    }
   });
 });

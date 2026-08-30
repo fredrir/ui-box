@@ -22,9 +22,12 @@ use crate::vision::Vision;
 pub const ARTIFACT_TOKEN: &str = "{{artifact}}";
 pub const FLOWS_DIR: &str = "flows";
 
+pub const NOTHING_VERDICT: &str = "nothing_verified";
+
 struct Outcome {
     body: Value,
     passed: bool,
+    verified_nothing: bool,
 }
 
 pub fn run(config: &Config, args: &RunArgs) -> Result<Summary> {
@@ -67,33 +70,50 @@ pub fn verify(config: &Config, args: &VerifyArgs) -> Result<Summary> {
 
     let mut results = Vec::new();
     let mut failed = 0;
+    let mut proved_nothing = 0;
     for path in &flows {
         let mut run_args = args.run.clone();
         run_args.flow = Some(path.clone());
         let outcome = execute(config, &run_args, Some(args))?;
-        if !outcome.passed {
+        if outcome.verified_nothing {
+            proved_nothing += 1;
+        } else if !outcome.passed {
             failed += 1;
         }
         results.push(outcome.body);
     }
 
+    let verdict = if failed > 0 {
+        "fail"
+    } else if proved_nothing > 0 {
+        NOTHING_VERDICT
+    } else {
+        "pass"
+    };
     let body = json!({
+        "status": verdict,
         "since": args.since,
         "flows": flows.len(),
         "failed": failed,
-        "verdict": if failed == 0 { "pass" } else { "fail" },
+        "nothing_verified": proved_nothing,
+        "verdict": verdict,
         "results": results,
     });
     note!("{} of {} flows failed", failed, flows.len());
-    Ok(if failed == 0 {
-        Summary::ok(body)
-    } else {
-        Summary::failed(body)
+    if verdict == NOTHING_VERDICT {
+        note!("{proved_nothing} flow(s) proved nothing, which is not a pass");
+    }
+    Ok(match verdict {
+        "fail" => Summary::failed(body),
+        NOTHING_VERDICT => Summary::nothing(body),
+        _ => Summary::ok(body),
     })
 }
 
 fn finish(outcome: Outcome) -> Summary {
-    if outcome.passed {
+    if outcome.verified_nothing {
+        Summary::nothing(outcome.body)
+    } else if outcome.passed {
         Summary::ok(outcome.body)
     } else {
         Summary::failed(outcome.body)
@@ -205,18 +225,26 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
             }
         }
         match executor.perform(step) {
-            Ok(outcome) => {
-                if let Some(artifacts) = outcome.snap {
+            Ok(mut outcome) => {
+                if let Some(artifacts) = outcome.snap.take() {
                     snaps.push(artifacts);
                 }
                 if outcome.ok {
                     note!("ok   {}", step.label());
                 } else {
+                    let verdict = if outcome.verified_nothing() {
+                        "none"
+                    } else {
+                        "fail"
+                    };
                     note!(
-                        "fail {}: {}",
+                        "{verdict} {}: {}",
                         step.label(),
                         outcome.error.as_deref().unwrap_or("no reason given")
                     );
+                    if outcome.verified_nothing() {
+                        note!("this step proved nothing, it is not the UI failing");
+                    }
                     if !args.keep_going {
                         halted = Some(step.label());
                         break;
@@ -257,11 +285,14 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
         .unwrap_or(0);
     meta.steps_total = executor.total;
     meta.steps_failed = executor.failed + golden_failures;
+    meta.steps_nothing = executor.nothing;
     meta.ended = Some(now_iso());
     meta.verdict = if failure.is_some() {
         "error".to_string()
     } else if meta.steps_failed > 0 {
         "fail".to_string()
+    } else if meta.steps_nothing > 0 {
+        NOTHING_VERDICT.to_string()
     } else {
         "pass".to_string()
     };
@@ -276,7 +307,9 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
     }
 
     let passed = meta.verdict == "pass";
+    let verified_nothing = meta.verdict == NOTHING_VERDICT;
     let body = json!({
+        "status": meta.verdict,
         "run": executor.run.id,
         "run_dir": executor.run.path,
         "flow": flow.flow,
@@ -288,6 +321,7 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
         "verdict": meta.verdict,
         "steps_total": meta.steps_total,
         "steps_failed": meta.steps_failed,
+        "steps_nothing": meta.steps_nothing,
         "halted_at": halted,
         "placed": placement.as_ref().map(|placed| json!({
             "remote_path": placed.remote_path,
@@ -304,7 +338,15 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
         meta.steps_failed,
         meta.steps_total
     );
-    Ok(Outcome { body, passed })
+    if verified_nothing {
+        note!("nothing was verified: an assertion could not prove anything about the page");
+        note!("exit 0 here means no work was done, not that the UI is correct");
+    }
+    Ok(Outcome {
+        body,
+        passed,
+        verified_nothing,
+    })
 }
 
 fn pinned_by_goldens(config: &Config, verify: Option<&VerifyArgs>, flow: &Flow) -> bool {

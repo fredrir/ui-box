@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use super::executor::{snap_json, Executor};
+use super::flows::NOTHING_VERDICT;
 use super::{driver_options, driver_run_dir, ensure_surface, probe_backend, terminate};
 use crate::backend;
 use crate::cli::{ActArgs, CloseArgs, EvalArgs, OpenArgs, SnapArgs, WakeArgs};
@@ -132,30 +133,41 @@ pub fn act(config: &Config, args: &ActArgs) -> Result<Summary> {
     let mut meta = executor.run.read_meta()?;
     meta.steps_total = executor.total;
     meta.steps_failed += executor.failed;
+    meta.steps_nothing += executor.nothing;
     executor.run.write_meta(&meta)?;
 
     let outcome = outcome?;
+    let status = if outcome.ok {
+        "passed"
+    } else if outcome.verified_nothing() {
+        NOTHING_VERDICT
+    } else {
+        "failed"
+    };
     let body = json!({
         "session": record.id,
         "run": record.id,
+        "status": status,
         "verb": step.verb(),
         "step": step.label(),
         "step_ok": outcome.ok,
         "error": outcome.error,
+        "error_kind": outcome.kind,
         "steps_total": executor.total,
         "expires_in": record.expires_in(),
     });
     if outcome.ok {
         note!("{} ok", step.label());
-        Ok(Summary::ok(body))
-    } else {
-        note!(
-            "{} failed: {}",
-            step.label(),
-            outcome.error.as_deref().unwrap_or("no reason given")
-        );
-        Ok(Summary::failed(body))
+        return Ok(Summary::ok(body));
     }
+    let reason = outcome.error.as_deref().unwrap_or("no reason given");
+    if outcome.verified_nothing() {
+        note!("{} proved nothing: {reason}", step.label());
+        note!("this is not the UI failing, the page was never in a state to check");
+        return Ok(Summary::nothing(body));
+    }
+    note!("{} failed: {reason}", step.label());
+    Ok(Summary::failed(body))
 }
 
 pub fn snap(config: &Config, args: &SnapArgs) -> Result<Summary> {
@@ -222,6 +234,8 @@ pub fn close(config: &Config, args: &CloseArgs) -> Result<Summary> {
     meta.steps_total = record.step_count;
     meta.verdict = if meta.steps_failed > 0 {
         "fail".to_string()
+    } else if meta.steps_nothing > 0 {
+        NOTHING_VERDICT.to_string()
     } else {
         "pass".to_string()
     };
@@ -241,9 +255,11 @@ pub fn close(config: &Config, args: &CloseArgs) -> Result<Summary> {
         "run": record.id,
         "run_dir": run.path,
         "driver_closed": driver_closed,
+        "status": meta.verdict,
         "verdict": meta.verdict,
         "steps_total": meta.steps_total,
         "steps_failed": meta.steps_failed,
+        "steps_nothing": meta.steps_nothing,
     })))
 }
 

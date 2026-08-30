@@ -22,13 +22,15 @@ import {
   describeError,
   errorKind,
 } from "./errors.js";
-import type { ReadinessReport } from "./injected/runtime.js";
+import { cropPng, pngDimensions, samplePixel, upscaleFactor, upscalePng } from "./image.js";
+import type { EvalDescriptor, ReadinessReport, VisibilityReport } from "./injected/runtime.js";
 import { parseSelector } from "./selector.js";
 import { SnapWriter } from "./snapshot.js";
 import { type StepPlan, normalizeStep } from "./steps.js";
 import { navigableTarget } from "./target.js";
 import type {
   ActResult,
+  ClipReport,
   ConsoleEntry,
   NetworkEntry,
   NormalizedStep,
@@ -47,6 +49,17 @@ interface PageErrorSource {
   freshPageErrors(): string[];
 }
 
+interface StepOutcome {
+  snap?: SnapResult;
+  report?: Record<string, unknown>;
+}
+
+interface ClipRequest {
+  selector?: string;
+  padding?: number;
+  minSide?: number;
+}
+
 export class Session {
   readonly id: string;
   readonly surface: Surface;
@@ -63,6 +76,7 @@ export class Session {
   private pendingNetwork: NetworkEntry[] = [];
   private ready = false;
   private closed = false;
+  private readonly benignConsole: RegExp[];
 
   private constructor(
     id: string,
@@ -82,6 +96,7 @@ export class Session {
       Math.min(options.maxSnapWidth ?? MAX_SNAP_WIDTH, MAX_SNAP_WIDTH),
     );
     this.ttlMs = sessionTtlMs(options);
+    this.benignConsole = compilePatterns(options.benignConsole);
     this.onExpire = onExpire;
     this.touch();
   }
@@ -148,8 +163,8 @@ export class Session {
     try {
       plan = normalizeStep(rawStep);
       this.assertReady();
-      const snap = await this.execute(plan);
-      const uncaught = this.freshPageErrors();
+      const outcome = await this.execute(plan);
+      const uncaught = this.freshPageErrors().filter((text) => !this.isBenign(text));
       if (uncaught.length > 0) {
         return this.failure(started, plan, {
           kind: "pageerror",
@@ -163,7 +178,8 @@ export class Session {
         durationMs: Date.now() - started,
         url: await this.backend.currentUrl().catch(() => undefined),
       };
-      if (snap) result.snap = snap;
+      if (outcome.snap) result.snap = outcome.snap;
+      if (outcome.report) result.report = outcome.report;
       return result;
     } catch (err) {
       const detail = errorDetail(err);
@@ -176,19 +192,19 @@ export class Session {
     }
   }
 
-  async snap(mode: SnapMode = "text", name?: string): Promise<SnapResult> {
+  async snap(mode: SnapMode = "text", name?: string, clip: ClipRequest = {}): Promise<SnapResult> {
     this.touch();
     this.assertReady();
-    return this.captureSnap(mode, name);
+    return this.captureSnap(mode, name, clip);
   }
 
-  async evaluate(expr: string): Promise<unknown> {
+  async evaluate(expr: string): Promise<EvalDescriptor> {
     this.touch();
     if (typeof expr !== "string" || expr.trim().length === 0) {
       throw new DriverError("params", "eval requires a non-empty expr string", RPC_INVALID_PARAMS);
     }
     this.assertReady();
-    return this.backend.evaluate(expr);
+    return this.backend.evalDescribe(expr);
   }
 
   async close(): Promise<void> {
@@ -212,7 +228,7 @@ export class Session {
       );
   }
 
-  private async execute(plan: StepPlan): Promise<SnapResult | undefined> {
+  private async execute(plan: StepPlan): Promise<StepOutcome> {
     const timeout = plan.timeoutMs ?? this.options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
 
     if ("open" in plan.step) {
@@ -222,11 +238,11 @@ export class Session {
       );
       this.ready = false;
       await this.gateOnReadiness();
-      return undefined;
+      return {};
     }
     if ("click" in plan.step) {
       await this.backend.click(parseSelector(plan.step.click), timeout);
-      return undefined;
+      return {};
     }
     if ("type" in plan.step) {
       const body = plan.step.type;
@@ -236,26 +252,29 @@ export class Session {
         { clear: body.clear !== false, delayMs: body.delayMs ?? 0 },
         timeout,
       );
-      return undefined;
+      return {};
     }
     if ("key" in plan.step) {
       await this.backend.press(plan.step.key);
-      return undefined;
+      return {};
     }
     if ("wait_for" in plan.step) {
       await this.backend.waitFor(parseSelector(plan.step.wait_for), timeout);
-      return undefined;
+      return {};
     }
     if ("assert_text" in plan.step) {
       await this.assertText(plan);
-      return undefined;
+      return {};
     }
     if ("assert_absent" in plan.step) {
       await this.assertAbsent(plan.step.assert_absent, plan.timeoutMs);
-      return undefined;
+      return {};
+    }
+    if ("assert_visible" in plan.step) {
+      return { report: await this.assertVisible(plan.step.assert_visible, plan.timeoutMs) };
     }
     const body = plan.step.snap;
-    return this.captureSnap(body.mode, body.name);
+    return { snap: await this.captureSnap(body.mode, body.name, { selector: body.clip }) };
   }
 
   private async assertText(plan: StepPlan): Promise<void> {
@@ -306,6 +325,102 @@ export class Session {
     }
   }
 
+  private async assertVisible(
+    raw: string,
+    timeoutMs: number | null,
+  ): Promise<Record<string, unknown>> {
+    const selector = parseSelector(raw);
+    const timeout = timeoutMs ?? DEFAULT_ASSERT_TIMEOUT_MS;
+    const deadline = Date.now() + Math.max(timeout, 0);
+    let report = await this.backend.describeElement(selector);
+    while (!report.visible && Date.now() < deadline) {
+      await delay(READINESS_POLL_MS);
+      report = await this.backend.describeElement(selector);
+    }
+    const pixel = await this.centrePixel(report);
+    const evidence: Record<string, unknown> = {
+      visible: report.visible,
+      matches: report.matches,
+      rect: report.rect,
+      hitTest: report.hitTest,
+      styles: report.styles,
+      ...(pixel ? { pixel } : {}),
+    };
+    if (report.visible) return evidence;
+    throw new DriverError(
+      "assertion",
+      `"${raw}" is not visible: ${report.reasons.join("; ")}`,
+      undefined,
+      { detail: JSON.stringify(evidence) },
+    );
+  }
+
+  private async centrePixel(report: VisibilityReport): Promise<string | null> {
+    const rect = report.rect;
+    if (!rect || rect.width < 1 || rect.height < 1) return null;
+    try {
+      const shot = await this.backend.screenshot();
+      const dims = pngDimensions(shot);
+      const scale = report.viewport.width > 0 ? dims.width / report.viewport.width : 1;
+      const x = Math.round((rect.x + rect.width / 2) * scale);
+      const y = Math.round((rect.y + rect.height / 2) * scale);
+      if (x < 0 || y < 0 || x >= dims.width || y >= dims.height) return null;
+      return samplePixel(shot, x, y);
+    } catch {
+      return null;
+    }
+  }
+
+  private async clipShot(shot: Buffer, request: ClipRequest): Promise<[Buffer, ClipReport]> {
+    const raw = request.selector!;
+    const report = await this.backend.describeElement(parseSelector(raw));
+    if (report.matches === 0) {
+      throw new DriverError(
+        "selector",
+        `clip selector "${raw}" matched no element; nothing was cropped`,
+        RPC_INVALID_PARAMS,
+      );
+    }
+    if (report.matches > 1) {
+      throw new DriverError(
+        "strictness",
+        `clip selector "${raw}" matched ${report.matches} elements; refine it so the crop is unambiguous`,
+        RPC_INVALID_PARAMS,
+      );
+    }
+    const rect = report.rect;
+    if (!rect || rect.width < 1 || rect.height < 1) {
+      throw new DriverError(
+        "selector",
+        `clip selector "${raw}" resolved to a ${rect?.width ?? 0}x${rect?.height ?? 0} box; there is nothing to crop`,
+        RPC_INVALID_PARAMS,
+      );
+    }
+
+    const dims = pngDimensions(shot);
+    const scale = report.viewport.width > 0 ? dims.width / report.viewport.width : 1;
+    const padding = Math.max(0, Math.round(request.padding ?? this.options.clipPadding ?? 8));
+    const minSide = Math.max(1, Math.round(request.minSide ?? this.options.clipMinSide ?? 96));
+    const box = {
+      x: Math.round((rect.x - padding) * scale),
+      y: Math.round((rect.y - padding) * scale),
+      width: Math.round((rect.width + padding * 2) * scale),
+      height: Math.round((rect.height + padding * 2) * scale),
+    };
+    const cropped = cropPng(shot, box);
+    const croppedDims = pngDimensions(cropped);
+    const upscale = upscaleFactor(croppedDims.width, croppedDims.height, minSide);
+    const pixel = samplePixel(
+      shot,
+      Math.round((rect.x + rect.width / 2) * scale),
+      Math.round((rect.y + rect.height / 2) * scale),
+    );
+    return [
+      upscalePng(cropped, upscale),
+      { selector: raw, rect: { ...rect }, padding, scale, upscale, pixel },
+    ];
+  }
+
   private async assertionFailure(message: string): Promise<DriverError> {
     const detail = await this.pageTextExcerpt();
     return new DriverError("assertion", message, undefined, detail ? { detail } : undefined);
@@ -323,7 +438,11 @@ export class Session {
     }
   }
 
-  private async captureSnap(mode: SnapMode, requestedName?: string): Promise<SnapResult> {
+  private async captureSnap(
+    mode: SnapMode,
+    requestedName?: string,
+    clip: ClipRequest = {},
+  ): Promise<SnapResult> {
     const wantsText = mode === "text" || mode === "both" || mode === "layout";
     const wantsPng = mode === "png" || mode === "both";
     if (wantsPng && !this.snaps.enabled) {
@@ -343,7 +462,13 @@ export class Session {
           layout: mode === "layout",
         })
       : undefined;
-    const png = wantsPng ? await this.backend.screenshot() : undefined;
+    let png = wantsPng ? await this.backend.screenshot() : undefined;
+    let clipReport: ClipReport | undefined;
+    if (png && clip.selector) {
+      const [cropped, report] = await this.clipShot(png, clip);
+      png = cropped;
+      clipReport = report;
+    }
 
     const written = await this.snaps.write(name, text, png);
     const drained = await this.drainQuietly();
@@ -355,6 +480,7 @@ export class Session {
       network: drained.network,
       url: await this.backend.currentUrl().catch(() => undefined),
     };
+    if (clipReport) result.clip = clipReport;
     if (text !== undefined) result.text = text;
     if (written.txtPath) result.txtPath = written.txtPath;
     if (written.pngPath) result.pngPath = written.pngPath;
@@ -387,6 +513,15 @@ export class Session {
     );
   }
 
+  private isBenign(text: string): boolean {
+    return this.benignConsole.some((pattern) => pattern.test(text));
+  }
+
+  private markBenign(entries: ConsoleEntry[]): ConsoleEntry[] {
+    if (this.benignConsole.length === 0) return entries;
+    return entries.map((entry) => (this.isBenign(entry.text) ? { ...entry, benign: true } : entry));
+  }
+
   private freshPageErrors(): string[] {
     const source = this.backend as unknown as Partial<PageErrorSource>;
     if (typeof source.freshPageErrors !== "function") return [];
@@ -407,13 +542,13 @@ export class Session {
       const networkEntries = this.pendingNetwork.concat(drained.network);
       this.pendingConsole = [];
       this.pendingNetwork = [];
-      return { console: consoleEntries, network: networkEntries };
+      return { console: this.markBenign(consoleEntries), network: networkEntries };
     } catch {
       const consoleEntries = this.pendingConsole;
       const networkEntries = this.pendingNetwork;
       this.pendingConsole = [];
       this.pendingNetwork = [];
-      return { console: consoleEntries, network: networkEntries };
+      return { console: this.markBenign(consoleEntries), network: networkEntries };
     }
   }
 
@@ -430,6 +565,24 @@ export class Session {
       this.expiry = null;
     }
   }
+}
+
+function compilePatterns(sources: string[] | undefined): RegExp[] {
+  if (!Array.isArray(sources)) return [];
+  const out: RegExp[] = [];
+  for (const source of sources) {
+    if (typeof source !== "string" || source.length === 0) continue;
+    try {
+      out.push(new RegExp(source));
+    } catch (err) {
+      throw new DriverError(
+        "params",
+        `invalid benignConsole pattern ${JSON.stringify(source)}: ${(err as Error).message}`,
+        RPC_INVALID_PARAMS,
+      );
+    }
+  }
+  return out;
 }
 
 function errorDetail(err: unknown): string | null {

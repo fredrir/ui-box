@@ -35,6 +35,8 @@ pub struct Meta {
     pub verdict: String,
     pub steps_total: usize,
     pub steps_failed: usize,
+    #[serde(default)]
+    pub steps_nothing: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +69,7 @@ impl Meta {
             verdict: "open".to_string(),
             steps_total: 0,
             steps_failed: 0,
+            steps_nothing: 0,
             flow: None,
             target: None,
             viewport: None,

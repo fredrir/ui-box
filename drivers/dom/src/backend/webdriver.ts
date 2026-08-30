@@ -5,10 +5,12 @@ import { delimiter, join } from "node:path";
 import { DEFAULT_TIMEOUT_MS, type DeterminismPlan, envNumber, envString } from "../config.js";
 import { DriverError, RPC_ATTACH_FAILED } from "../errors.js";
 import type {
+  EvalDescriptor,
   ReadinessReport,
   RuntimeConfig,
   RuntimeDrain,
   SnapshotConfig,
+  VisibilityReport,
 } from "../injected/runtime.js";
 import { uiboxRuntime } from "../injected/runtime.js";
 import { isoFrom } from "../recorder.js";
@@ -16,7 +18,7 @@ import type { ParsedSelector } from "../selector.js";
 import type { DrainedEvents, OpenOptions, Surface, Viewport } from "../types.js";
 import { WebDriverClient } from "../webdriver/client.js";
 import { keyActions, parseChord } from "../webdriver/keys.js";
-import { type Backend, type FillOptions, toRuntimeSpec } from "./index.js";
+import { type Backend, type FillOptions, callExpression, toRuntimeSpec } from "./index.js";
 
 const RUNTIME_SOURCE = uiboxRuntime.toString();
 const DRIVER_BOOT_TIMEOUT_MS = 20_000;
@@ -198,10 +200,20 @@ export class WebDriverBackend implements Backend {
   }
 
   async evaluate(expr: string): Promise<unknown> {
-    const trimmed = expr.trim();
-    const isFunction = /^(async\s+)?(function\b|\(|[A-Za-z_$][\w$]*\s*=>)/.test(trimmed);
-    const script = isFunction ? `return (${trimmed})();` : `return (${trimmed});`;
-    return this.client.executeScript(script, []);
+    return this.client.executeScript(`return ${callExpression(expr)};`, []);
+  }
+
+  async evalDescribe(expr: string): Promise<EvalDescriptor> {
+    await this.ensureRuntime();
+    return (await this.client.executeScript(
+      `return window.__uibox["describeValue"](${callExpression(expr)});`,
+      [],
+    )) as EvalDescriptor;
+  }
+
+  async describeElement(selector: ParsedSelector): Promise<VisibilityReport> {
+    await this.ensureRuntime();
+    return (await this.call("describeElement", [toRuntimeSpec(selector)])) as VisibilityReport;
   }
 
   async snapshotText(config: SnapshotConfig): Promise<string> {

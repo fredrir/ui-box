@@ -1,4 +1,10 @@
-import type { ReadinessReport, RuntimeSelectorSpec, SnapshotConfig } from "../injected/runtime.js";
+import type {
+  EvalDescriptor,
+  ReadinessReport,
+  RuntimeSelectorSpec,
+  SnapshotConfig,
+  VisibilityReport,
+} from "../injected/runtime.js";
 import type { ParsedSelector } from "../selector.js";
 import type { DrainedEvents, Surface, Viewport } from "../types.js";
 
@@ -23,12 +29,20 @@ export interface Backend {
   countMatches(selector: ParsedSelector): Promise<number>;
   textOf(selector: ParsedSelector, limit: number): Promise<string[]>;
   evaluate(expr: string): Promise<unknown>;
+  evalDescribe(expr: string): Promise<EvalDescriptor>;
+  describeElement(selector: ParsedSelector): Promise<VisibilityReport>;
   snapshotText(config: SnapshotConfig): Promise<string>;
   readiness(): Promise<ReadinessReport>;
   screenshot(): Promise<Buffer>;
   currentUrl(): Promise<string>;
   drain(): Promise<DrainedEvents>;
   dispose(): Promise<void>;
+}
+
+export function callExpression(expr: string): string {
+  const trimmed = expr.trim();
+  const isFunction = /^(async\s+)?(function\b|\(|[A-Za-z_$][\w$]*\s*=>)/.test(trimmed);
+  return isFunction ? `(${trimmed})()` : `(${trimmed})`;
 }
 
 export function toRuntimeSpec(selector: ParsedSelector): RuntimeSelectorSpec {
