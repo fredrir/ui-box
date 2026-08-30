@@ -455,6 +455,16 @@ fn check_forward(config: &Config, lab: Option<&dyn Backend>) -> Option<Check> {
 fn check_target(config: &Config, lab: Option<&dyn Backend>) -> Option<Check> {
     let target = config.target.as_deref()?;
     let (host, port) = http_endpoint(target)?;
+    if config.backend.host().is_some() && is_loopback(&host) && covers_port(config, port) {
+        return Some(Check::pass(
+            "target",
+            format!(
+                "{target} is published into the lab by the forward on {port}. That tunnel \
+                 exists only while a session is open, so reachability is settled at `open`, \
+                 not here; the forward check covers the local end"
+            ),
+        ));
+    }
     let Some(lab) = lab else {
         return Some(Check::unknown(
             "target",
@@ -495,12 +505,6 @@ fn refused(config: &Config, target: &str, host: &str, port: u16) -> String {
     }
     if config.backend.host().is_none() {
         return format!("{target} refused the connection. Nothing is listening on {host}:{port}.");
-    }
-    if covers_port(config, port) {
-        return format!(
-            "{target} names the lab's own loopback. Nothing answers there, even though a \
-             forward publishes {port} into the lab. Check that this machine is serving it."
-        );
     }
     format!(
         "{target} names the lab's own loopback. Nothing answers there. Pass --forward {port} \
@@ -735,6 +739,52 @@ mod tests {
         let detail = refused(&config, "http://localhost:3000", "localhost", 3000);
         assert!(detail.contains("the lab's own loopback"), "{detail}");
         assert!(detail.contains("--forward 3000"), "{detail}");
+    }
+
+    #[test]
+    fn a_forwarded_target_is_never_probed_behind_the_tunnel_that_serves_it() {
+        let mut config = lab_config(vec![crate::config::Forward {
+            lab_port: 3000,
+            local_host: "127.0.0.1".to_string(),
+            local_port: 3000,
+        }]);
+        config.target = Some("http://localhost:3000".to_string());
+        let check = check_target(&config, None).expect("a target is checked");
+        assert!(
+            check.ok,
+            "the -R tunnel exists only during a session, so probing without one warns about \
+             a healthy setup every time: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("Nothing answers"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn an_unforwarded_loopback_target_is_still_probed_and_named() {
+        let mut config = lab_config(Vec::new());
+        config.target = Some("http://localhost:3000".to_string());
+        let check = check_target(&config, None).expect("a target is checked");
+        assert!(
+            !check.ok,
+            "with no covering forward the lab probe answers a real question"
+        );
+        assert!(check.detail.starts_with("unknown:"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_target_on_another_port_than_the_forward_is_not_suppressed() {
+        let mut config = lab_config(vec![crate::config::Forward {
+            lab_port: 3000,
+            local_host: "127.0.0.1".to_string(),
+            local_port: 3000,
+        }]);
+        config.target = Some("http://localhost:5173".to_string());
+        let check = check_target(&config, None).expect("a target is checked");
+        assert!(!check.ok, "5173 is not covered by a forward on 3000");
     }
 
     #[test]

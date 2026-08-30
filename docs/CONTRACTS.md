@@ -16,7 +16,19 @@ Method names go on the wire verbatim, namespace included:
     "driver.eval"  ({ sessionId, expr })            -> { value }
     "driver.close" ({ sessionId })                  -> {}
 
-`mode` is "text" | "png" | "both". Text is the default everywhere.
+`mode` is "text" | "png" | "both" | "layout". Text is the default everywhere.
+
+`layout` is the accessibility tree annotated with bounding rectangles. It exists
+because TEXT FLATTENS SPACE: the tree can say an element exists and is reachable,
+but not that it is FINDABLE. A blind run confirmed a "clear filters" control that
+was present, labelled, reachable and hit-testable -- and 761px away at the far
+edge of its card, which is the problem the user actually reported. Every text
+signal said ship it.
+
+So the guidance "prefer text, reach for png when the question is visual" is
+backwards for any complaint of the form "I cannot find X": you cannot know the
+question is visual until you have looked. `layout` is the cheap mode that can
+answer it.
 
 `tauri` on `driver.info` is optional and additive:
 
@@ -86,7 +98,13 @@ vocabulary and the selector grammar; the core does not interpret either.
       - key: Enter
       - wait_for: "text=Welcome"
       - assert_text: "text=Welcome"
+      - assert_absent: "role=button[name=Clear]"
       - snap: { name: after-submit, mode: text }
+
+`assert_absent` asserts an element is NOT present. Conditional rendering is most
+of UI work, and without this a flow can only assert something correlated with the
+absence -- which keeps passing after the condition is removed. It is the negative
+half of `wait_for` and must distinguish "gone" from "never looked".
 
 Selector grammar, uniform across drivers:
 
@@ -324,9 +342,30 @@ For the same reason, never restate an exit code in prose ("UI TEST FAILED
 Precise-looking text that is sometimes false is worse than text that does not
 claim the detail.
 
+A recorded flow with no assertions is this bug in its purest form. `record`
+turns an exploration into a file, and a file of `click` and `snap` steps and
+nothing else PASSES AGAINST A BLANK PAGE -- it is a transcript wearing the label
+of a test, and it is green forever. Found by a blind run whose author noticed and
+hand-wrote the assertions back in; the next author will not.
+
+So `record` must emit assertions derived from what it observed, and a flow that
+asserts nothing must not silently pass. The feature whose whole purpose is to
+create regression tests is the last place this class should survive.
+
 When adding any check, ask what its answer is when there is nothing to check.
 If that answer is indistinguishable from success -- or from any definite
 answer -- it is this bug again.
+
+And ask the companion question: WHAT IS ITS ANSWER WHEN EVERYTHING IS HEALTHY?
+If the check still fires, it is measuring its own construction rather than the
+system. `check_target` probed the lab for a loopback target whose tunnel exists
+only while a session is open, so a perfectly healthy setup always read as
+refused. Advisory severity kept that from blocking, but a check that fires on
+the healthy path is worse than no check: it teaches the reader the line is
+noise, and the next time it fires for a real reason nobody reads it.
+
+Both questions catch the same thing from opposite ends -- a confident answer
+about nothing.
 
 ## 9. Load-bearing guarantees
 
