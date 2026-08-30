@@ -1,11 +1,14 @@
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -28,6 +31,30 @@ pub struct DriverInfo {
     pub version: String,
     #[serde(default)]
     pub surfaces: Vec<String>,
+    #[serde(default, deserialize_with = "readable_tauri")]
+    pub tauri: Option<TauriInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TauriInfo {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, rename = "tauriDriver")]
+    pub tauri_driver: Option<String>,
+    #[serde(default, rename = "nativeDriver")]
+    pub native_driver: Option<String>,
+    #[serde(default)]
+    pub source: Option<Value>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn readable_tauri<'de, D>(deserializer: D) -> Result<Option<TauriInfo>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -77,6 +104,48 @@ pub struct SnapResult {
     pub network: Vec<Value>,
 }
 
+const STDERR_TAIL_LINES: usize = 20;
+const STDERR_DRAIN: Duration = Duration::from_millis(250);
+
+struct Stderr {
+    lines: Mutex<VecDeque<String>>,
+    drained: AtomicBool,
+}
+
+impl Stderr {
+    fn new() -> Arc<Stderr> {
+        Arc::new(Stderr {
+            lines: Mutex::new(VecDeque::new()),
+            drained: AtomicBool::new(false),
+        })
+    }
+
+    fn push(&self, line: String) {
+        let Ok(mut lines) = self.lines.lock() else {
+            return;
+        };
+        if lines.len() == STDERR_TAIL_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    fn tail(&self) -> Option<String> {
+        let deadline = Instant::now() + STDERR_DRAIN;
+        while !self.drained.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let lines = self.lines.lock().ok()?;
+        (!lines.is_empty()).then(|| {
+            lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>()
+                .join("\n")
+        })
+    }
+}
+
 pub struct Connection {
     name: String,
     writer: Box<dyn Write + Send>,
@@ -85,6 +154,7 @@ pub struct Connection {
     timeout: Duration,
     pid: Option<u32>,
     log: Option<PathBuf>,
+    stderr: Option<Arc<Stderr>>,
     child: Option<Child>,
     prefix: String,
 }
@@ -99,13 +169,20 @@ impl Connection {
             .with_context(|| format!("cannot start driver `{}`", spec.display()))?;
         let stdin = child.stdin.take().context("driver has no stdin")?;
         let stdout = child.stdout.take().context("driver has no stdout")?;
-        if let Some(stderr) = child.stderr.take() {
-            let name = spec.name.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    note!("[{name}] {line}");
-                }
-            });
+        let stderr = Stderr::new();
+        match child.stderr.take() {
+            Some(pipe) => {
+                let name = spec.name.clone();
+                let retained = Arc::clone(&stderr);
+                std::thread::spawn(move || {
+                    for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                        note!("[{name}] {line}");
+                        retained.push(line);
+                    }
+                    retained.drained.store(true, Ordering::Release);
+                });
+            }
+            None => stderr.drained.store(true, Ordering::Release),
         }
         let pid = child.id();
         Ok(Connection {
@@ -116,6 +193,7 @@ impl Connection {
             timeout,
             pid: Some(pid),
             log: None,
+            stderr: Some(stderr),
             child: Some(child),
             prefix: method_prefix(),
         })
@@ -152,6 +230,7 @@ impl Connection {
             timeout,
             pid: Some(pid),
             log: Some(log),
+            stderr: None,
             child: Some(child),
             prefix: method_prefix(),
         })
@@ -178,6 +257,7 @@ impl Connection {
             timeout,
             pid: Some(pid),
             log: Some(dir.join(DRIVER_LOG)),
+            stderr: None,
             child: None,
             prefix: method_prefix(),
         })
@@ -343,15 +423,21 @@ impl Connection {
     }
 
     fn log_tail(&self) -> Option<String> {
-        let path = self.log.as_ref()?;
-        let mut contents = String::new();
-        File::open(path).ok()?.read_to_string(&mut contents).ok()?;
-        let tail: Vec<&str> = contents.lines().rev().take(20).collect();
-        if tail.is_empty() {
-            return None;
+        match &self.log {
+            Some(path) => file_tail(path),
+            None => self.stderr.as_ref()?.tail(),
         }
-        Some(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
     }
+}
+
+fn file_tail(path: &Path) -> Option<String> {
+    let mut contents = String::new();
+    File::open(path).ok()?.read_to_string(&mut contents).ok()?;
+    let tail: Vec<&str> = contents.lines().rev().take(STDERR_TAIL_LINES).collect();
+    if tail.is_empty() {
+        return None;
+    }
+    Some(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
 }
 
 fn command_for(spec: &DriverSpec) -> Result<Command> {
@@ -439,4 +525,98 @@ pub fn process_alive(pid: u32) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(raw: &str) -> DriverInfo {
+        serde_json::from_str(raw).expect("driver info")
+    }
+
+    fn shim(script: &str) -> DriverSpec {
+        DriverSpec {
+            name: "shim".to_string(),
+            surface: crate::config::Surface::Web,
+            argv: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            entry: None,
+            remote: false,
+        }
+    }
+
+    #[test]
+    fn a_driver_that_dies_carries_its_stderr_into_the_error() {
+        let spec = shim(
+            "echo 'Warning: remote port forwarding failed for listen port 3000' >&2; exit 255",
+        );
+        let mut conn = Connection::spawn(&spec, Duration::from_secs(5)).expect("spawn");
+        let err = conn
+            .info()
+            .expect_err("a driver that exits cannot answer info");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("remote port forwarding failed for listen port 3000"),
+            "forward::classify matches on this text, so discarding it loses the diagnosis:              {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_dead_driver_stays_a_driver_exit_for_classify_to_narrow() {
+        let spec = shim("exit 1");
+        let mut conn = Connection::spawn(&spec, Duration::from_secs(5)).expect("spawn");
+        let err = conn
+            .info()
+            .expect_err("a driver that exits cannot answer info");
+        let kind = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<DriverError>())
+            .map(DriverError::kind);
+        assert_eq!(kind, Some("driver_exited"));
+    }
+
+    #[test]
+    fn a_driver_that_predates_the_tauri_block_still_answers() {
+        let parsed = info(r#"{"name":"dom","version":"0.1","surfaces":["web"]}"#);
+        assert_eq!(parsed.name, "dom");
+        assert!(parsed.tauri.is_none());
+    }
+
+    #[test]
+    fn a_tauri_block_ui_box_cannot_read_never_costs_us_the_rest_of_info() {
+        let parsed = info(
+            r#"{"name":"dom","version":"0.1","surfaces":["web"],
+                "tauri":{"ok":"maybe","tauriDriver":[1,2]}}"#,
+        );
+        assert_eq!(parsed.surfaces, vec!["web".to_string()]);
+        assert!(
+            parsed.tauri.is_none(),
+            "an unreadable block is unknown, not a verdict"
+        );
+    }
+
+    #[test]
+    fn source_is_carried_verbatim_whatever_shape_the_driver_chose() {
+        let parsed = info(
+            r#"{"name":"dom","version":"0.1","surfaces":["tauri"],
+                "tauri":{"ok":false,"tauriDriver":"tauri-driver","nativeDriver":null,
+                         "source":{"tauriDriver":"default","nativeDriver":"unset"},
+                         "reason":"tauri-driver is not on PATH on the driver host"}}"#,
+        );
+        let tauri = parsed.tauri.expect("tauri block");
+        assert!(!tauri.ok);
+        assert_eq!(tauri.tauri_driver.as_deref(), Some("tauri-driver"));
+        assert_eq!(tauri.native_driver, None);
+        assert_eq!(
+            tauri.source.and_then(|source| source
+                .get("tauriDriver")
+                .and_then(Value::as_str)
+                .map(str::to_string)),
+            Some("default".to_string())
+        );
+        assert_eq!(
+            tauri.reason.as_deref(),
+            Some("tauri-driver is not on PATH on the driver host")
+        );
+    }
 }

@@ -8,8 +8,8 @@ use super::executor::{snap_json, Executor};
 use super::{driver_options, driver_run_dir, ensure_surface, probe_backend, terminate};
 use crate::backend;
 use crate::cli::{ActArgs, CloseArgs, EvalArgs, OpenArgs, SnapArgs, WakeArgs};
-use crate::config::{Config, Viewport};
-use crate::driver::{self, Connection};
+use crate::config::{Config, Forward, Viewport};
+use crate::driver::{self, forward, Connection};
 use crate::flow::{self, SnapStep, Step};
 use crate::note;
 use crate::output::Summary;
@@ -27,6 +27,8 @@ pub fn open(config: &Config, args: &OpenArgs) -> Result<Summary> {
         Some(raw) => Viewport::from_str(raw)?,
         None => config.viewport,
     };
+
+    forward::guard(config, &target, &format!("ui-box open {target}"))?;
 
     let backend = backend::select(config)?;
     probe_backend(backend.as_ref())?;
@@ -57,7 +59,7 @@ pub fn open(config: &Config, args: &OpenArgs) -> Result<Summary> {
         Err(err) => {
             terminate(pid);
             let _ = store.remove(&run.id);
-            return Err(err);
+            return Err(forward::classify(err, config));
         }
     };
 
@@ -88,6 +90,7 @@ pub fn open(config: &Config, args: &OpenArgs) -> Result<Summary> {
     meta.flow = args.flow.clone();
     meta.target = Some(target.clone());
     meta.viewport = Some(viewport);
+    meta.forward = config.forward.clone();
     run.write_meta(&meta)?;
 
     note!("session {} open on {surface} at {target}", run.id);
@@ -101,6 +104,7 @@ pub fn open(config: &Config, args: &OpenArgs) -> Result<Summary> {
         "surface": surface.as_str(),
         "target": target,
         "viewport": viewport.label(),
+        "forward": config.forward.iter().map(Forward::label).collect::<Vec<String>>(),
         "backend": backend.url(),
         "driver": { "name": info.name, "version": info.version },
         "expires_in": record.expires_in(),

@@ -1,4 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { constants, accessSync, statSync } from "node:fs";
+import { hostname } from "node:os";
+import { delimiter, join } from "node:path";
 import { DEFAULT_TIMEOUT_MS, type DeterminismPlan, envNumber, envString } from "../config.js";
 import { DriverError, RPC_ATTACH_FAILED } from "../errors.js";
 import type {
@@ -18,6 +21,57 @@ import { type Backend, type FillOptions, toRuntimeSpec } from "./index.js";
 const RUNTIME_SOURCE = uiboxRuntime.toString();
 const DRIVER_BOOT_TIMEOUT_MS = 20_000;
 const POLL_INTERVAL_MS = 100;
+const STDERR_TAIL_LIMIT = 2000;
+const EXIT_DRAIN_MS = 250;
+const DEFAULT_TAURI_DRIVER = "tauri-driver";
+const DRIVER_LOCALITY = "the driver runs where the display is, not where ui-box was invoked";
+
+export type TauriBinSource = "option" | "env" | "default" | "unset";
+
+export interface TauriBins {
+  tauriDriver: string;
+  nativeDriver: string | null;
+  source: { tauriDriver: TauriBinSource; nativeDriver: TauriBinSource };
+}
+
+export interface TauriBinProbe {
+  tauriDriver: string;
+  nativeDriver: string | null;
+  reason: string | null;
+}
+
+interface BinKind {
+  label: string;
+  envName: string;
+  optionName: string;
+}
+
+interface ResolvedBin {
+  value: string | null;
+  source: TauriBinSource;
+}
+
+interface SpawnFault {
+  error: Error | null;
+  stderrTail: string;
+}
+
+interface SpawnedDriver {
+  child: ChildProcess;
+  fault: SpawnFault;
+}
+
+const TAURI_DRIVER_KIND: BinKind = {
+  label: "tauri-driver",
+  envName: "UIBOX_TAURI_DRIVER",
+  optionName: "options.tauriDriverBin",
+};
+
+const NATIVE_DRIVER_KIND: BinKind = {
+  label: "native webdriver",
+  envName: "UIBOX_NATIVE_DRIVER",
+  optionName: "options.nativeDriverBin",
+};
 
 export class WebDriverBackend implements Backend {
   readonly surface: Surface = "tauri";
@@ -57,19 +111,20 @@ export class WebDriverBackend implements Backend {
       maxEvents: 500,
     };
 
-    let child: ChildProcess | null = null;
+    let spawned: SpawnedDriver | null = null;
     let baseUrl = options.webdriverUrl ?? envString("UIBOX_WEBDRIVER_URL") ?? null;
 
     if (!baseUrl) {
       const port = options.webdriverPort ?? envNumber("UIBOX_WEBDRIVER_PORT") ?? 4444;
       baseUrl = `http://127.0.0.1:${port}`;
-      child = spawnTauriDriver(port, options, plan);
+      spawned = spawnTauriDriver(port, options, plan);
     }
+    const child = spawned?.child ?? null;
 
     const client = new WebDriverClient(baseUrl);
     await waitForDriver(
       client,
-      child,
+      spawned,
       baseUrl,
       options.driverBootTimeoutMs ?? DRIVER_BOOT_TIMEOUT_MS,
     );
@@ -279,13 +334,98 @@ function buildCapabilities(
   return { alwaysMatch, firstMatch: [{}] };
 }
 
-function spawnTauriDriver(port: number, options: OpenOptions, plan: DeterminismPlan): ChildProcess {
-  const bin = options.tauriDriverBin ?? envString("UIBOX_TAURI_DRIVER") ?? "tauri-driver";
-  const native = options.nativeDriverBin ?? envString("UIBOX_NATIVE_DRIVER");
-  const args = ["--port", String(port)];
-  if (native) args.push("--native-driver", native);
+function resolveBin(
+  option: string | undefined,
+  envName: string,
+  fallback: string | null,
+): ResolvedBin {
+  if (option) return { value: option, source: "option" };
+  const fromEnv = envString(envName);
+  if (fromEnv) return { value: fromEnv, source: "env" };
+  if (fallback === null) return { value: null, source: "unset" };
+  return { value: fallback, source: "default" };
+}
 
-  const child = spawn(bin, args, {
+export function resolveTauriBins(options: OpenOptions): TauriBins {
+  const tauri = resolveBin(options.tauriDriverBin, TAURI_DRIVER_KIND.envName, DEFAULT_TAURI_DRIVER);
+  const native = resolveBin(options.nativeDriverBin, NATIVE_DRIVER_KIND.envName, null);
+  return {
+    tauriDriver: tauri.value ?? DEFAULT_TAURI_DRIVER,
+    nativeDriver: native.value,
+    source: { tauriDriver: tauri.source, nativeDriver: native.source },
+  };
+}
+
+export function findExecutable(bin: string): string | null {
+  if (bin.includes("/")) return isExecutableFile(bin) ? bin : null;
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (dir.length === 0) continue;
+    const candidate = join(dir, bin);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return null;
+}
+
+function isExecutableFile(path: string): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function probeTauriBins(bins: TauriBins): TauriBinProbe {
+  const tauriPath = findExecutable(bins.tauriDriver);
+  const nativePath = bins.nativeDriver === null ? null : findExecutable(bins.nativeDriver);
+  const reason =
+    tauriPath === null
+      ? unresolvable(TAURI_DRIVER_KIND, bins.tauriDriver, bins.source.tauriDriver)
+      : bins.nativeDriver !== null && nativePath === null
+        ? unresolvable(NATIVE_DRIVER_KIND, bins.nativeDriver, bins.source.nativeDriver)
+        : null;
+  return {
+    tauriDriver: tauriPath ?? bins.tauriDriver,
+    nativeDriver: nativePath ?? bins.nativeDriver,
+    reason,
+  };
+}
+
+function unresolvable(kind: BinKind, bin: string, source: TauriBinSource): string {
+  const problem = bin.includes("/") ? "is not an executable file" : "is not on PATH";
+  return `${kind.label} "${bin}" (${binOrigin(kind, source)}) ${problem} on ${hostLabel()}; ${DRIVER_LOCALITY}`;
+}
+
+function binOrigin(kind: BinKind, source: TauriBinSource): string {
+  if (source === "option") return `from ${kind.optionName}`;
+  if (source === "env") return `from ${kind.envName}`;
+  return `the default, no ${kind.envName} or ${kind.optionName} set`;
+}
+
+function hostLabel(): string {
+  return `the driver host ${hostname()}`;
+}
+
+function spawnTauriDriver(
+  port: number,
+  options: OpenOptions,
+  plan: DeterminismPlan,
+): SpawnedDriver {
+  const bins = resolveTauriBins(options);
+  const probe = probeTauriBins(bins);
+  if (probe.reason !== null) {
+    throw new DriverError("attach", probe.reason, RPC_ATTACH_FAILED);
+  }
+
+  const args = ["--port", String(port)];
+  if (probe.nativeDriver) args.push("--native-driver", probe.nativeDriver);
+  if (Number.isFinite(options.nativeDriverPort)) {
+    args.push("--native-port", String(options.nativeDriverPort));
+  }
+
+  const fault: SpawnFault = { error: null, stderrTail: "" };
+  const child = spawn(probe.tauriDriver, args, {
     stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
@@ -293,24 +433,60 @@ function spawnTauriDriver(port: number, options: OpenOptions, plan: DeterminismP
       ...(options.webdriverEnv ?? {}),
     },
   });
-  child.stdout?.on("data", (chunk: Buffer) => process.stderr.write(`[tauri-driver] ${chunk}`));
-  child.stderr?.on("data", (chunk: Buffer) => process.stderr.write(`[tauri-driver] ${chunk}`));
-  child.on("error", (err) => process.stderr.write(`[tauri-driver] spawn failed: ${err.message}\n`));
-  return child;
+  child.stdout?.on("data", (chunk: Buffer) => relay(fault, chunk));
+  child.stderr?.on("data", (chunk: Buffer) => relay(fault, chunk));
+  child.on("error", (err) => {
+    fault.error = err;
+    process.stderr.write(`[tauri-driver] spawn failed: ${err.message}\n`);
+  });
+  return { child, fault };
+}
+
+function relay(fault: SpawnFault, chunk: Buffer): void {
+  process.stderr.write(`[tauri-driver] ${chunk}`);
+  fault.stderrTail = `${fault.stderrTail}${chunk.toString()}`.slice(-STDERR_TAIL_LIMIT);
+}
+
+function saidOnStderr(fault: SpawnFault | null): string {
+  const text = fault?.stderrTail.trim() ?? "";
+  return text.length > 0 ? `; tauri-driver said: ${text}` : "";
+}
+
+function settle(child: ChildProcess): Promise<void> {
+  const stream = child.stderr;
+  if (!stream || stream.readableEnded) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(), EXIT_DRAIN_MS);
+    timer.unref();
+    stream.once("end", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 async function waitForDriver(
   client: WebDriverClient,
-  child: ChildProcess | null,
+  spawned: SpawnedDriver | null,
   baseUrl: string,
   bootTimeoutMs: number,
 ): Promise<void> {
   const deadline = Date.now() + bootTimeoutMs;
+  const child = spawned?.child ?? null;
+  const fault = spawned?.fault ?? null;
   for (;;) {
-    if (child && child.exitCode !== null) {
+    if (fault?.error) {
       throw new DriverError(
         "attach",
-        `webdriver process exited with code ${child.exitCode} before accepting connections`,
+        `tauri-driver could not be started: ${fault.error.message}${saidOnStderr(fault)}`,
+        RPC_ATTACH_FAILED,
+      );
+    }
+    if (child && child.exitCode !== null) {
+      await settle(child);
+      throw new DriverError(
+        "attach",
+        `webdriver process exited with code ${child.exitCode} before accepting connections${saidOnStderr(fault)}`,
         RPC_ATTACH_FAILED,
       );
     }
@@ -322,7 +498,7 @@ async function waitForDriver(
         killChild(child);
         throw new DriverError(
           "attach",
-          `no webdriver responded at ${baseUrl} within ${bootTimeoutMs}ms: ${(err as Error).message}`,
+          `no webdriver responded at ${baseUrl} within ${bootTimeoutMs}ms: ${(err as Error).message}${saidOnStderr(fault)}`,
           RPC_ATTACH_FAILED,
         );
       }

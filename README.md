@@ -4,7 +4,7 @@ ui-box opens a web page and uses it the way a person would. It clicks buttons. I
 
 After each step it describes what is on the screen in words: the headings, the buttons, the text. It takes a screenshot when you ask for one, and when something goes wrong. It compares those screenshots against ones you have approved, and tells you where they differ.
 
-The browser runs on another Linux machine over ssh, or on the machine you are already on.
+The browser runs on another Linux machine over ssh, or on the machine you are already on. When it runs elsewhere, `localhost` in an address means that machine, not this one, so ui-box can publish a port across for it.
 
 A session can be saved to a file and replayed later.
 
@@ -32,4 +32,5 @@ ui-box reads these from the environment or from a `.env` file.
 | `UIBOX_RPC_TIMEOUT` | seconds to wait on the browser before giving up, default `30` |
 | `UIBOX_HOME` | where ui-box looks for its global `.env` |
 | `UIBOX_COPY_VIA` | a machine to route file transfers through, when the two ends cannot reach each other |
-| `UIBOX_SSH_OPTS` | extra options passed to ssh |
+| `UIBOX_FORWARD` | publishes a port on this machine into the lab, so the browser there can reach it |
+| `UIBOX_SSH_OPTS` | replaces the default ssh options, rather than adding to them |

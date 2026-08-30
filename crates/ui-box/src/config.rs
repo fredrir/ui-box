@@ -12,6 +12,7 @@ pub use ui_box_core::BackendSpec;
 pub const DEFAULT_ARTIFACTS: &str = ".uibox/runs";
 pub const DEFAULT_DISPLAY: &str = "1280x800x24";
 pub const DEFAULT_SESSION_TTL: u64 = 900;
+pub const DEFAULT_FORWARD_HOST: &str = "127.0.0.1";
 pub const DEFAULT_RPC_TIMEOUT: u64 = 30;
 pub const PROJECT_FILE: &str = "uibox.toml";
 pub const GLOBAL_ENV_FILE: &str = ".env";
@@ -89,6 +90,114 @@ impl FromStr for Viewport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forward {
+    pub lab_port: u16,
+    pub local_host: String,
+    pub local_port: u16,
+}
+
+impl Forward {
+    pub fn label(&self) -> String {
+        if self.local_host != DEFAULT_FORWARD_HOST {
+            return format!("{}:{}:{}", self.lab_port, self.local_host, self.local_port);
+        }
+        if self.lab_port == self.local_port {
+            return self.lab_port.to_string();
+        }
+        format!("{}:{}", self.lab_port, self.local_port)
+    }
+
+    pub fn connect_host(&self) -> &str {
+        self.local_host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+    }
+
+    pub fn is_default_host(&self) -> bool {
+        self.local_host == DEFAULT_FORWARD_HOST
+    }
+}
+
+impl fmt::Display for Forward {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label())
+    }
+}
+
+impl FromStr for Forward {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let spec = s.trim();
+        let (lab_port, local_host, local_port) = match (spec.find(':'), spec.rfind(':')) {
+            (Some(first), Some(last)) if first == last => (
+                forward_port(&spec[..first], spec)?,
+                DEFAULT_FORWARD_HOST.to_string(),
+                forward_port(&spec[first + 1..], spec)?,
+            ),
+            (Some(first), Some(last)) => {
+                let host = spec[first + 1..last].trim();
+                if host.is_empty() {
+                    return Err(bad_forward(spec));
+                }
+                (
+                    forward_port(&spec[..first], spec)?,
+                    host.to_string(),
+                    forward_port(&spec[last + 1..], spec)?,
+                )
+            }
+            _ => {
+                let port = forward_port(spec, spec)?;
+                (port, DEFAULT_FORWARD_HOST.to_string(), port)
+            }
+        };
+        Ok(Forward {
+            lab_port,
+            local_host,
+            local_port,
+        })
+    }
+}
+
+fn bad_forward(spec: &str) -> anyhow::Error {
+    anyhow!(
+        "bad forward {spec:?}, expected REMOTE, REMOTE:LOCAL or REMOTE:HOST:LOCAL \
+         with ports 1-65535"
+    )
+}
+
+fn forward_port(raw: &str, spec: &str) -> Result<u16> {
+    match raw.trim().parse::<u16>() {
+        Ok(0) | Err(_) => Err(bad_forward(spec)),
+        Ok(port) => Ok(port),
+    }
+}
+
+pub fn parse_forwards(raw: &str) -> Result<Vec<Forward>> {
+    let mut out: Vec<Forward> = Vec::new();
+    for token in raw.split([',', ' ', '\t', '\n', '\r']) {
+        if token.trim().is_empty() {
+            continue;
+        }
+        let forward = Forward::from_str(token)?;
+        if out.contains(&forward) {
+            continue;
+        }
+        if let Some(held) = out.iter().find(|held| held.lab_port == forward.lab_port) {
+            bail!(
+                "forwards {} and {} both bind lab port {}, which one connection cannot hold twice",
+                held.label(),
+                forward.label(),
+                forward.lab_port
+            );
+        }
+        out.push(forward);
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Origin {
     pub key: String,
@@ -103,6 +212,8 @@ pub struct Overrides {
     pub artifacts: Option<PathBuf>,
     pub goldens: Option<String>,
     pub session_ttl: Option<u64>,
+    pub forward: Vec<String>,
+    pub app_args: Vec<String>,
     pub force: bool,
 }
 
@@ -115,6 +226,7 @@ pub struct Config {
     pub goldens: Option<String>,
     pub session_ttl: Duration,
     pub rpc_timeout: Duration,
+    pub forward: Vec<Forward>,
     pub project: Option<String>,
     pub lab: Option<String>,
     pub surface: Option<Surface>,
@@ -125,6 +237,13 @@ pub struct Config {
     pub artifact: Option<String>,
     pub driver_dom_remote: Option<String>,
     pub driver_dom: Option<String>,
+    pub tauri_driver: Option<String>,
+    pub native_driver: Option<String>,
+    pub webdriver_port: Option<u16>,
+    pub native_driver_port: Option<u16>,
+    pub webdriver_env: BTreeMap<String, String>,
+    pub app_args: Option<Vec<String>>,
+    pub capabilities: Option<serde_json::Value>,
     pub vision: Option<String>,
     pub force: bool,
     pub project_root: Option<PathBuf>,
@@ -170,6 +289,14 @@ impl Config {
         if let Some(value) = overrides.session_ttl {
             cli.insert("session_ttl".to_string(), value.to_string());
         }
+        if !overrides.forward.is_empty() {
+            cli.insert("forward".to_string(), overrides.forward.join(","));
+        }
+        if !overrides.app_args.is_empty() {
+            let encoded = serde_json::to_string(&overrides.app_args)
+                .context("cannot encode --app-arg values")?;
+            cli.insert("app_args".to_string(), encoded);
+        }
 
         let layers = Layers {
             cli,
@@ -213,6 +340,34 @@ impl Config {
             None => None,
         };
 
+        let forward = match layers.take_opt("forward", &mut origins) {
+            Some(raw) => parse_forwards(&raw)
+                .with_context(|| format!("UIBOX_FORWARD resolved to {raw:?}"))?,
+            None => Vec::new(),
+        };
+
+        let webdriver_port = layers.take_port("webdriver_port", &mut origins)?;
+        let native_driver_port = layers.take_port("native_driver_port", &mut origins)?;
+        let webdriver_env = match layers.take_opt("webdriver_env", &mut origins) {
+            Some(raw) => parse_env_pairs(&raw)
+                .with_context(|| format!("UIBOX_WEBDRIVER_ENV resolved to {raw:?}"))?,
+            None => BTreeMap::new(),
+        };
+        let app_args = match layers.take_opt("app_args", &mut origins) {
+            Some(raw) => Some(
+                parse_string_array(&raw)
+                    .with_context(|| format!("UIBOX_APP_ARGS resolved to {raw:?}"))?,
+            ),
+            None => None,
+        };
+        let capabilities = match layers.take_opt("capabilities", &mut origins) {
+            Some(raw) => Some(
+                serde_json::from_str(&raw)
+                    .with_context(|| format!("UIBOX_CAPABILITIES resolved to {raw:?}"))?,
+            ),
+            None => None,
+        };
+
         Ok(Config {
             backend,
             display,
@@ -221,6 +376,7 @@ impl Config {
             goldens,
             session_ttl: Duration::from_secs(ttl),
             rpc_timeout: Duration::from_secs(rpc_timeout),
+            forward,
             project: layers.take_opt("project", &mut origins),
             lab: layers.take_opt("lab", &mut origins),
             surface,
@@ -231,6 +387,13 @@ impl Config {
             artifact: layers.take_opt("artifact", &mut origins),
             driver_dom_remote: layers.take_opt("driver_dom_remote", &mut origins),
             driver_dom: layers.take_opt("driver_dom", &mut origins),
+            tauri_driver: layers.take_opt("tauri_driver", &mut origins),
+            native_driver: layers.take_opt("native_driver", &mut origins),
+            webdriver_port,
+            native_driver_port,
+            webdriver_env,
+            app_args,
+            capabilities,
             vision: layers.take_opt("vision", &mut origins),
             force: overrides.force,
             project_root,
@@ -307,6 +470,19 @@ impl Layers {
         }
     }
 
+    fn take_port(&self, key: &str, origins: &mut Vec<Origin>) -> Result<Option<u16>> {
+        let Some(raw) = self.take_opt(key, origins) else {
+            return Ok(None);
+        };
+        let port: u16 = raw.trim().parse().with_context(|| {
+            format!(
+                "UIBOX_{} resolved to {raw:?}, expected a port 1-65535",
+                key.to_ascii_uppercase()
+            )
+        })?;
+        Ok(Some(port))
+    }
+
     fn take_opt(&self, key: &str, origins: &mut Vec<Origin>) -> Option<String> {
         let (value, source) = self.lookup(key)?;
         origins.push(Origin {
@@ -316,6 +492,36 @@ impl Layers {
         });
         Some(value)
     }
+}
+
+pub fn parse_string_array(raw: &str) -> Result<Vec<String>> {
+    let expected = "expected a JSON array of strings, e.g. [\"--open\",\"/a path with spaces\"]";
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw.trim()).map_err(|_| anyhow!("{expected}"))?;
+    let items = parsed.as_array().ok_or_else(|| anyhow!("{expected}"))?;
+    items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("{item} is not a string, {expected}"))
+        })
+        .collect()
+}
+
+pub fn parse_env_pairs(raw: &str) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = token.split_once('=') else {
+            bail!("bad env pair {token:?}, expected KEY=VALUE separated by commas");
+        };
+        out.insert(key.trim().to_string(), value.trim().to_string());
+    }
+    Ok(out)
 }
 
 pub fn uibox_home() -> PathBuf {
@@ -472,5 +678,90 @@ mod tests {
     fn normalizes_config_keys() {
         assert_eq!(normalize_key("UIBOX_BACKEND"), "backend");
         assert_eq!(normalize_key("backend"), "backend");
+    }
+
+    fn forward(spec: &str) -> Forward {
+        Forward::from_str(spec).expect(spec)
+    }
+
+    #[test]
+    fn a_forward_is_remote_first() {
+        assert_eq!(
+            forward("3000"),
+            Forward {
+                lab_port: 3000,
+                local_host: DEFAULT_FORWARD_HOST.to_string(),
+                local_port: 3000
+            }
+        );
+        assert_eq!(
+            forward("3000:5173"),
+            Forward {
+                lab_port: 3000,
+                local_host: DEFAULT_FORWARD_HOST.to_string(),
+                local_port: 5173
+            }
+        );
+        assert_eq!(
+            forward("3000:h:5173"),
+            Forward {
+                lab_port: 3000,
+                local_host: "h".to_string(),
+                local_port: 5173
+            }
+        );
+    }
+
+    #[test]
+    fn a_forward_defaults_the_local_end_to_ipv4() {
+        assert_eq!(forward("3000").local_host, "127.0.0.1");
+        assert_eq!(forward("3000:5173").local_host, "127.0.0.1");
+        assert_eq!(forward("3000:[::1]:5173").connect_host(), "::1");
+        assert_eq!(forward("3000:::1:5173").connect_host(), "::1");
+    }
+
+    #[test]
+    fn a_forward_label_round_trips() {
+        for spec in ["3000", "3000:5173", "3000:h:5173"] {
+            assert_eq!(forward(spec).label(), spec);
+            assert_eq!(forward(&forward(spec).label()), forward(spec));
+        }
+    }
+
+    #[test]
+    fn a_forward_that_is_not_a_port_is_refused() {
+        for spec in ["abc", "0", "70000", "3000:0", "3000:abc", "3000::5173", ""] {
+            assert!(Forward::from_str(spec).is_err(), "{spec:?} parsed");
+        }
+    }
+
+    #[test]
+    fn an_app_argument_containing_a_space_survives_verbatim() {
+        assert_eq!(
+            parse_string_array(r#"["--open","/a path with spaces.tex"]"#).expect("args"),
+            vec!["--open", "/a path with spaces.tex"]
+        );
+        assert!(parse_string_array("[]").expect("empty").is_empty());
+    }
+
+    #[test]
+    fn app_arguments_that_are_not_a_json_string_array_are_refused() {
+        for raw in ["--open /a path", "[1,2]", "{}", "[\"a\"", ""] {
+            assert!(parse_string_array(raw).is_err(), "{raw:?} parsed");
+        }
+    }
+
+    #[test]
+    fn forwards_split_on_commas_and_spaces() {
+        let parsed = parse_forwards("3000, 5173:4000  8080").expect("forwards");
+        let labels: Vec<String> = parsed.iter().map(Forward::label).collect();
+        assert_eq!(labels, vec!["3000", "5173:4000", "8080"]);
+        assert!(parse_forwards("").expect("empty").is_empty());
+    }
+
+    #[test]
+    fn one_lab_port_cannot_carry_two_forwards() {
+        assert!(parse_forwards("3000:5173,3000:5174").is_err());
+        assert_eq!(parse_forwards("3000,3000").expect("dedupe").len(), 1);
     }
 }

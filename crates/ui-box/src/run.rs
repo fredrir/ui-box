@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Surface, Viewport};
+use crate::config::{Forward, Surface, Viewport};
 use crate::flow::Step;
 
 pub const META: &str = "meta.json";
@@ -41,6 +41,8 @@ pub struct Meta {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport: Option<Viewport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward: Vec<Forward>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +70,7 @@ impl Meta {
             flow: None,
             target: None,
             viewport: None,
+            forward: Vec::new(),
             source: None,
             remote_path: None,
             cached: None,

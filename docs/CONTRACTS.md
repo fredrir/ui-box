@@ -9,7 +9,7 @@ process and speaks this. Every driver implements every method.
 
 Method names go on the wire verbatim, namespace included:
 
-    "driver.info"   -> { name, version, surfaces: ["web"|"tauri"|"tui"] }
+    "driver.info"   -> { name, version, surfaces: ["web"|"tauri"|"tui"], tauri? }
     "driver.open"  ({ target, viewport, options })  -> { sessionId }
     "driver.act"   ({ sessionId, step })            -> { ok, error? }
     "driver.snap"  ({ sessionId, mode, name })      -> { text?, pngPath?, console[], network[] }
@@ -17,6 +17,18 @@ Method names go on the wire verbatim, namespace included:
     "driver.close" ({ sessionId })                  -> {}
 
 `mode` is "text" | "png" | "both". Text is the default everywhere.
+
+`tauri` on `driver.info` is optional and additive:
+
+    tauri: { ok, tauriDriver, nativeDriver, source, reason? }
+
+Only the DRIVER can answer whether the tauri surface is usable, because the
+binaries resolve in the driver's own environment on the driver's host, which is
+not the environment the core runs in. A core that probed for itself would be
+answering a different question and would sometimes be confidently wrong.
+
+A driver that omits the field has not said "no" -- it has said nothing. Per §8 a
+consumer must report that as unknown, never as a pass.
 
 DRIVER LOCALITY. The driver runs WHERE THE DISPLAY IS, which for the primary
 workflow is dlab-ui, not the invoking Mac. When the backend is `ssh://`, the
@@ -109,9 +121,32 @@ Precedence: CLI flag > environment > project uibox.toml > global .env.
     UIBOX_ARTIFACTS    .uibox/runs
     UIBOX_GOLDENS      /var/lib/dlab-state/ui-box/goldens.git
     UIBOX_SESSION_TTL  900
+    UIBOX_FORWARD      3000  |  3000:5173  |  3000:localhost:5173  (repeatable)
+    UIBOX_TAURI_DRIVER path to tauri-driver, on the DRIVER's host
+    UIBOX_NATIVE_DRIVER path to WebKitWebDriver, on the DRIVER's host
 
 `--force` sets DLAB_FORCE=1 on the ssh backend. When the dlab ssh proxy
 refuses to start a lab, its stderr is propagated verbatim, never wrapped.
+
+FORWARDING. `localhost` in a target is the DRIVER HOST's loopback, not the
+invoking machine's. A dev server on the Mac is not on it. `--forward` publishes
+a local port into the lab over the driver's own ssh connection:
+
+    --forward 3000                 lab 127.0.0.1:3000 -> here 127.0.0.1:3000
+    --forward 3000:5173            lab 127.0.0.1:3000 -> here 127.0.0.1:5173
+    --forward 3000:localhost:5173  lab 127.0.0.1:3000 -> here localhost:5173
+
+Remote-first, matching `ssh -R`: the first number is the one that appears in
+your target URL, because the target resolves inside the lab. Both ends bind
+loopback -- the lab shares a NAT bridge with every other guest and with the
+host, and a wildcard bind would publish a dev server to all of them.
+
+ui-box DOES NOT INFER a forward. A loopback target on an ssh backend with no
+covering forward is REFUSED before any ssh is spawned, with an error naming the
+port and the command that would work. Inferring would reconfigure the network as
+a side effect of a URL string, could succeed by accident against something
+unrelated listening on that port, and would leave the agent reasoning about an
+action it never requested. Narrow and loud.
 
 ## 5. Crate layout and pipeline API
 
@@ -217,13 +252,13 @@ Frozen so the skill and the hooks are not written against a guess.
 
     ui-box doctor
     ui-box wake   [--lab NAME]
-    ui-box open   <target> [--surface web|tauri|tui] [--viewport WxH]
+    ui-box open   <target> [--surface web|tauri|tui] [--viewport WxH] [--forward SPEC]
     ui-box act    <session> <step...>
     ui-box snap   <session> [--mode text|png|both] [--name NAME]
     ui-box eval   <session> <expr>
     ui-box close  <session>
     ui-box record <session|runid> [--format uibox|playwright] [-o FILE]
-    ui-box run    [flow.yaml] [--lab NAME] [--project NAME] [--force]
+    ui-box run    [flow.yaml] [--lab NAME] [--project NAME] [--force] [--forward SPEC]
     ui-box verify --since <git-ref>
     ui-box runs
     ui-box show   <runid>

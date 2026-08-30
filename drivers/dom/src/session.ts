@@ -26,6 +26,7 @@ import type { ReadinessReport } from "./injected/runtime.js";
 import { parseSelector } from "./selector.js";
 import { SnapWriter } from "./snapshot.js";
 import { type StepPlan, normalizeStep } from "./steps.js";
+import { navigableTarget } from "./target.js";
 import type {
   ActResult,
   ConsoleEntry,
@@ -405,25 +406,6 @@ function errorDetail(err: unknown): string | null {
   if (!(err instanceof DriverError) || !err.data) return null;
   const detail = err.data.detail;
   return typeof detail === "string" && detail.length > 0 ? detail : null;
-}
-
-function navigableTarget(target: string): string {
-  if (target.startsWith("exec:")) {
-    throw new DriverError(
-      "params",
-      `cannot navigate to "${target}"; exec: targets are launched, not navigated`,
-      RPC_INVALID_PARAMS,
-    );
-  }
-  if (target.startsWith("tui:")) {
-    throw new DriverError(
-      "params",
-      `target "${target}" belongs to the tui driver`,
-      RPC_INVALID_PARAMS,
-    );
-  }
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(target)) return target;
-  return `http://${target}`;
 }
 
 function delay(ms: number): Promise<void> {

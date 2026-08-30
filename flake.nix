@@ -29,6 +29,41 @@
       packagesFor =
         pkgs:
         let
+          isLinux = pkgs.stdenv.hostPlatform.isLinux;
+
+          tauri-driver = pkgs.rustPlatform.buildRustPackage rec {
+            pname = "tauri-driver";
+            version = "2.0.6";
+
+            src = pkgs.fetchCrate {
+              inherit pname version;
+              hash = "sha256-fTCkEs4NLBW0khaHL4jpVNkrbQg22YPsRMjfJNqnCWA=";
+            };
+
+            cargoHash = "sha256-MThAcU+U8PyBGauh3dy7ZRvRX9INmOEeghIlQEGLAPs=";
+
+            meta = {
+              description = "WebDriver server that drives Tauri applications";
+              homepage = "https://github.com/tauri-apps/tauri";
+              license = with lib.licenses; [
+                asl20
+                mit
+              ];
+              mainProgram = "tauri-driver";
+              platforms = lib.platforms.linux;
+            };
+          };
+
+          domWrapperArgs = [
+            "--set-default LIBGL_ALWAYS_SOFTWARE 1"
+            "--set-default PLAYWRIGHT_BROWSERS_PATH ${pkgs.playwright-driver.browsers}"
+            "--set-default PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD 1"
+          ]
+          ++ lib.optionals isLinux [
+            "--set-default UIBOX_TAURI_DRIVER ${lib.getExe tauri-driver}"
+            "--set-default UIBOX_NATIVE_DRIVER ${lib.getExe pkgs.webkitgtk_4_1}"
+          ];
+
           uibox-vision = pkgs.python3Packages.buildPythonApplication {
             pname = "uibox-vision";
             inherit version;
@@ -85,9 +120,7 @@
 
             postFixup = ''
               wrapProgram $out/bin/ui-box-dom \
-                --set-default LIBGL_ALWAYS_SOFTWARE 1 \
-                --set-default PLAYWRIGHT_BROWSERS_PATH ${pkgs.playwright-driver.browsers} \
-                --set-default PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD 1
+                ${lib.concatStringsSep " \\\n    " domWrapperArgs}
             '';
 
             meta = {
@@ -164,7 +197,8 @@
             uibox-vision
             ;
           default = ui-box;
-        };
+        }
+        // lib.optionalAttrs isLinux { inherit tauri-driver; };
     in
     {
       packages = eachSystem packagesFor;
@@ -274,6 +308,16 @@
               '';
             };
 
+            tauriDriver = mkOption {
+              type = types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.tauri-driver;
+              defaultText = lib.literalExpression "tauri-driver from the ui-box flake";
+              description = ''
+                WebDriver bridge the native driver runs. Its major version
+                must match the Tauri major of the app under test.
+              '';
+            };
+
             packages = mkOption {
               type = types.listOf types.package;
               default = with self.packages.${pkgs.stdenv.hostPlatform.system}; [
@@ -288,6 +332,7 @@
 
           config = mkIf cfg.enable {
             environment.systemPackages = cfg.packages ++ [
+              cfg.tauriDriver
               pkgs.xorg-server
               pkgs.xdpyinfo
               pkgs.xset
@@ -304,8 +349,11 @@
                 UIBOX_GOLDENS = toString cfg.goldens;
                 UIBOX_HOME = toString cfg.stateDir;
                 UIBOX_NATIVE_DRIVER = lib.getExe pkgs.webkitgtk_4_1;
+                UIBOX_TAURI_DRIVER = lib.getExe cfg.tauriDriver;
               }
             );
+
+            services.openssh.settings.SetEnv = "DISPLAY=${cfg.display}";
 
             systemd.tmpfiles.rules = [ "d /tmp/.X11-unix 1777 root root -" ];
 

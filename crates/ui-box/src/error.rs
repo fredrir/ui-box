@@ -42,6 +42,78 @@ impl SessionError {
 }
 
 #[derive(Debug, Error)]
+pub enum ForwardError {
+    #[error(
+        "target {target} points at port {port} on {lab}, because {host} inside a target is \
+         {lab}'s loopback and not this machine's. No forward publishes that port, so nothing \
+         is listening there. The UI was never asked. Publish it and retry:\n    \
+         {command} --forward {port}"
+    )]
+    Missing {
+        target: String,
+        host: String,
+        port: u16,
+        lab: String,
+        command: String,
+    },
+
+    #[error(
+        "--forward {spec} has nothing to publish: nothing is listening on {endpoint} here. \
+         The UI was never asked. Start the local server first, or point the forward at the \
+         port it really binds"
+    )]
+    LocalClosed { spec: String, endpoint: String },
+
+    #[error(
+        "--forward {spec} would publish 127.0.0.1:{local}, where nothing is listening, but \
+         [::1]:{local} answers. The local server bound IPv6 only. The UI was never asked. \
+         Bind it to 127.0.0.1, or reach it as it stands with --forward {suggestion}"
+    )]
+    LocalIpv6Only {
+        spec: String,
+        local: u16,
+        suggestion: String,
+    },
+
+    #[error(
+        "{lab} refused the forward for port {ports} and the driver's ssh exited without \
+         opening a session. The UI was never asked. Three things do this: another session \
+         already holds {ports} on {lab}, a lingering ssh master from a session closed within \
+         the last minute still holds it, or sshd on {lab} refuses forwarding.{}",
+        detail(.log)
+    )]
+    Refused {
+        ports: String,
+        lab: String,
+        log: Option<String>,
+    },
+
+    #[error(
+        "UIBOX_DRIVER_DOM={command} carries its own ssh, so ui-box cannot put --forward \
+         {specs} on it. The UI was never asked, and dropping the forward silently would \
+         have looked like a broken page. Add {flags} to that command yourself, or unset \
+         UIBOX_DRIVER_DOM and let ui-box build the connection"
+    )]
+    OwnTransport {
+        command: String,
+        specs: String,
+        flags: String,
+    },
+}
+
+impl ForwardError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ForwardError::Missing { .. } => "forward_missing",
+            ForwardError::LocalClosed { .. } => "forward_unreachable",
+            ForwardError::LocalIpv6Only { .. } => "forward_ipv6_only",
+            ForwardError::Refused { .. } => "forward_refused",
+            ForwardError::OwnTransport { .. } => "forward_unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum DriverError {
     #[error("surface {surface} is not yet supported: no driver implements it")]
     UnsupportedSurface { surface: String },
@@ -102,6 +174,9 @@ pub fn kind_of(error: &anyhow::Error) -> &'static str {
         }
         if let Some(session) = cause.downcast_ref::<SessionError>() {
             return session.kind();
+        }
+        if let Some(forward) = cause.downcast_ref::<ForwardError>() {
+            return forward.kind();
         }
         if let Some(driver) = cause.downcast_ref::<DriverError>() {
             return driver.kind();

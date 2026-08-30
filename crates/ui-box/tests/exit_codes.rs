@@ -46,26 +46,28 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 }
 
 fn ui_box_with(driver: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ui-box"))
-        .args(args)
-        .env("UIBOX_ARTIFACTS", artifacts())
-        .env("UIBOX_BACKEND", "local://")
-        .env("UIBOX_HOME", artifacts())
-        .env("UIBOX_DRIVER_DOM", driver)
-        .env_remove("UIBOX_GOLDENS")
-        .output()
-        .expect("ui-box runs")
+    ui_box_env(args, &[("UIBOX_DRIVER_DOM", driver)])
 }
 
 fn ui_box(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ui-box"))
+    ui_box_env(args, &[])
+}
+
+fn ui_box_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ui-box"));
+    command
         .args(args)
         .env("UIBOX_ARTIFACTS", artifacts())
         .env("UIBOX_BACKEND", "local://")
         .env("UIBOX_HOME", artifacts())
         .env_remove("UIBOX_GOLDENS")
-        .output()
-        .expect("ui-box runs")
+        .env_remove("UIBOX_SURFACE")
+        .env_remove("UIBOX_FORWARD")
+        .env_remove("UIBOX_TARGET");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("ui-box runs")
 }
 
 fn code(output: &Output) -> i32 {
@@ -75,6 +77,23 @@ fn code(output: &Output) -> i32 {
 fn summary(output: &Output) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(stdout.trim()).unwrap_or_else(|_| panic!("not json: {stdout}"))
+}
+
+fn check(body: &serde_json::Value, name: &str) -> serde_json::Value {
+    body["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("no check named {name}"))
+}
+
+fn severity(body: &serde_json::Value, name: &str) -> String {
+    check(body, name)["severity"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[test]
@@ -113,22 +132,15 @@ fn a_malformed_step_is_a_tool_failure() {
 fn doctor_exits_two_only_when_a_blocking_check_fails() {
     let output = ui_box(&["doctor"]);
     let body = summary(&output);
-    let checks = body["checks"].as_array().expect("checks");
-    let severity = |name: &str| {
-        checks
-            .iter()
-            .find(|check| check["name"] == name)
-            .map(|check| check["severity"].as_str().unwrap_or_default().to_string())
-            .unwrap_or_else(|| panic!("no check named {name}"))
-    };
-    assert_eq!(severity("config"), "blocking");
-    assert_eq!(severity("artifacts"), "blocking");
-    assert_eq!(severity("backend"), "blocking");
-    assert_eq!(severity("driver.dom"), "blocking");
-    assert_eq!(severity("sessions"), "blocking");
-    assert_eq!(severity("goldens"), "advisory");
-    assert_eq!(severity("vision"), "advisory");
-    assert_eq!(severity("pipeline"), "advisory");
+    assert_eq!(severity(&body, "config"), "blocking");
+    assert_eq!(severity(&body, "artifacts"), "blocking");
+    assert_eq!(severity(&body, "backend"), "blocking");
+    assert_eq!(severity(&body, "driver.dom"), "blocking");
+    assert_eq!(severity(&body, "sessions"), "blocking");
+    assert_eq!(severity(&body, "goldens"), "advisory");
+    assert_eq!(severity(&body, "vision"), "advisory");
+    assert_eq!(severity(&body, "pipeline"), "advisory");
+    assert_eq!(severity(&body, "driver.tauri"), "advisory");
 
     let blocking = body["blocking_failed"].as_u64().expect("blocking_failed");
     let expected = if blocking > 0 { 2 } else { 0 };
@@ -223,4 +235,51 @@ fn a_path_the_driver_never_wrote_is_a_tool_failure_not_a_blank_page() {
     assert!(error.contains("no such file exists"), "{error}");
 
     let _ = ui_box_with(&driver, &["close", &session]);
+}
+
+#[test]
+fn the_tauri_driver_blocks_only_for_a_project_that_declares_that_surface() {
+    let web = summary(&ui_box(&["doctor"]));
+    assert_eq!(
+        severity(&web, "driver.tauri"),
+        "advisory",
+        "a web-only box must not fail doctor over a surface it never drives"
+    );
+
+    let declared = summary(&ui_box_env(&["doctor"], &[("UIBOX_SURFACE", "tauri")]));
+    assert_eq!(
+        severity(&declared, "driver.tauri"),
+        "blocking",
+        "declaring surface = tauri means nothing ui-box will be asked to do can run without it"
+    );
+}
+
+#[test]
+fn a_driver_that_cannot_report_on_tauri_is_never_a_tauri_pass() {
+    if !node_available() {
+        return;
+    }
+    let driver = format!("node {}", lying_driver().display());
+    let body = summary(&ui_box_with(&driver, &["doctor"]));
+    let tauri = check(&body, "driver.tauri");
+    assert_eq!(
+        tauri["ok"], false,
+        "a driver too old to answer has not said yes"
+    );
+    let detail = tauri["detail"].as_str().unwrap_or_default();
+    assert!(detail.starts_with("unknown:"), "{detail}");
+}
+
+#[test]
+fn doctor_makes_no_forward_claim_when_no_forward_was_declared() {
+    let body = summary(&ui_box(&["doctor"]));
+    let named = body["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .any(|check| check["name"] == "forward");
+    assert!(
+        !named,
+        "with nothing to check, doctor must stay silent rather than report a pass"
+    );
 }

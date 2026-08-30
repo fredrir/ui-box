@@ -58,6 +58,7 @@ export interface OpenOptions {
   webdriverEnv?: Record<string, string>;
   tauriDriverBin?: string;
   nativeDriverBin?: string;
+  nativeDriverPort?: number;
   appArgs?: string[];
   capabilities?: Record<string, unknown>;
   driverBootTimeoutMs?: number;

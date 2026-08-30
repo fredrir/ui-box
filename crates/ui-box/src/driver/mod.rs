@@ -1,11 +1,12 @@
 pub mod client;
+pub mod forward;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
 use crate::backend::ssh_options;
-use crate::config::{find_dir_upwards, Config, Surface};
+use crate::config::{find_dir_upwards, Config, Forward, Surface};
 use crate::error::DriverError;
 use crate::note;
 
@@ -70,7 +71,7 @@ fn resolve_dom(surface: Surface, config: &Config) -> Result<DriverSpec> {
         }
     }
     if let Some(host) = host {
-        let argv = remote_argv(&host, &remote_command(config));
+        let argv = remote_argv(&host, &remote_command(config), &config.forward);
         return Ok(DriverSpec {
             name: label,
             surface,
@@ -128,12 +129,22 @@ pub fn carries_own_transport(argv: &[String]) -> bool {
     base == "ssh"
 }
 
-pub fn remote_argv(host: &str, command: &[String]) -> Vec<String> {
+pub fn remote_argv(host: &str, command: &[String], forwards: &[Forward]) -> Vec<String> {
     let mut argv = vec!["ssh".to_string(), "-T".to_string()];
     argv.extend(ssh_options());
+    argv.extend(forward::ssh_args(forwards));
     argv.push(host.to_string());
     argv.extend(command.iter().cloned());
     argv
+}
+
+pub fn resolve_without_forwards(surface: Surface, config: &Config) -> Result<DriverSpec> {
+    if config.forward.is_empty() {
+        return resolve(surface, config);
+    }
+    let mut config = config.clone();
+    config.forward = Vec::new();
+    resolve(surface, &config)
 }
 
 pub fn dom_entry(config: &Config) -> PathBuf {
@@ -239,11 +250,45 @@ mod tests {
 
     #[test]
     fn the_remote_driver_runs_where_the_display_is() {
-        let argv = remote_argv("fredrir@dlab-ui", &words(DOM_DRIVER_REMOTE));
+        let argv = remote_argv("fredrir@dlab-ui", &words(DOM_DRIVER_REMOTE), &[]);
         assert_eq!(argv[0], "ssh");
         assert_eq!(argv[1], "-T");
         assert_eq!(argv[argv.len() - 2], "fredrir@dlab-ui");
         assert_eq!(argv[argv.len() - 1], DOM_DRIVER_REMOTE);
         assert!(argv.contains(&"BatchMode=yes".to_string()));
+        for absent in [
+            "-R",
+            "ExitOnForwardFailure=yes",
+            "ControlMaster=no",
+            "ControlPath=none",
+        ] {
+            assert!(
+                !argv.contains(&absent.to_string()),
+                "an undeclared forward must cost nothing: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_forward_rides_the_drivers_own_connection() {
+        let forwards = crate::config::parse_forwards("3000:5173").expect("forwards");
+        let argv = remote_argv("fredrir@dlab-ui", &words(DOM_DRIVER_REMOTE), &forwards);
+        let flags = argv.join(" ");
+        assert!(
+            flags.contains("-R 127.0.0.1:3000:127.0.0.1:5173"),
+            "{flags}"
+        );
+        for option in forward::EXCLUSIVE_OPTIONS {
+            assert!(argv.contains(&option.to_string()), "{flags}");
+        }
+        assert_eq!(argv[argv.len() - 2], "fredrir@dlab-ui");
+        assert_eq!(argv[argv.len() - 1], DOM_DRIVER_REMOTE);
+    }
+
+    #[test]
+    fn a_forward_never_reaches_the_short_lived_ssh_options() {
+        let options = ssh_options().join(" ");
+        assert!(!options.contains("-R"), "{options}");
+        assert!(!options.contains("ControlMaster"), "{options}");
     }
 }

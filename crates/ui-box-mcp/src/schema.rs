@@ -21,6 +21,13 @@ ui-box drives a real UI that runs inside the dlab-ui lab (a NixOS VM with Xvfb, 
 manager and Playwright browsers) and reports back as text. You stay on this machine; the
 UI does not.
 
+`localhost` in a target is the LAB's loopback, not this machine's. A dev server you
+started here is not on it. Publish the port across with `forward` (the first number is
+the one in your URL, because the URL resolves inside the lab). ui-box refuses a loopback
+target with no matching forward rather than letting the browser load an error page --
+if you see that refusal you have not found an application bug, you have not published
+the port yet.
+
 Normal loop: call ui_test_prepare first, then ui_open to get a session, then ui_act /
 ui_snap / ui_eval against that session, then ui_close. Freeze a session you like into a
 committed flow file with ui_record, and replay it later with ui_run.

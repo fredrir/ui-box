@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { probeTauriBins, resolveTauriBins } from "./backend/webdriver.js";
 import { DriverError, RPC_INVALID_PARAMS, RPC_SESSION_NOT_FOUND } from "./errors.js";
 import { RpcServer } from "./rpc.js";
 import { Session } from "./session.js";
@@ -15,6 +16,8 @@ import type {
 
 const DRIVER_NAME = "dom";
 const SURFACES = ["web", "tauri"] as const;
+const NO_OVERRIDE_SCOPE =
+  "resolved on the driver host from UIBOX_TAURI_DRIVER, UIBOX_NATIVE_DRIVER and PATH, with no per-session overrides";
 
 function redirectConsoleToStderr(): void {
   const write =
@@ -97,6 +100,7 @@ async function main(): Promise<void> {
     surfaces: SURFACES,
     selectors: ["css", "role", "text"],
     modes: ["text", "png", "both"],
+    tauri: tauriCapability(),
   }));
 
   server.method("driver.open", async (params) => openSession(registry, params as OpenParams));
@@ -118,6 +122,19 @@ async function main(): Promise<void> {
 
   await server.start();
   await registry.closeAll();
+}
+
+function tauriCapability(): Record<string, unknown> {
+  const bins = resolveTauriBins({});
+  const probe = probeTauriBins(bins);
+  const ok = probe.reason === null;
+  return {
+    ok,
+    tauriDriver: probe.tauriDriver,
+    nativeDriver: probe.nativeDriver,
+    source: bins.source,
+    reason: ok ? NO_OVERRIDE_SCOPE : `${probe.reason}; ${NO_OVERRIDE_SCOPE}`,
+  };
 }
 
 async function openSession(registry: SessionRegistry, params: OpenParams): Promise<unknown> {

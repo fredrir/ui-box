@@ -45,6 +45,25 @@ pub struct GlobalArgs {
     #[arg(long, global = true, value_name = "SECONDS")]
     pub session_ttl: Option<u64>,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "SPEC",
+        action = clap::ArgAction::Append,
+        help = "Publish a local port into the lab: REMOTE, REMOTE:LOCAL or REMOTE:HOST:LOCAL"
+    )]
+    pub forward: Vec<String>,
+
+    #[arg(
+        long = "app-arg",
+        global = true,
+        value_name = "ARG",
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true,
+        help = "One argument for the app under test, repeatable, passed through verbatim"
+    )]
+    pub app_args: Vec<String>,
+
     #[arg(long, global = true, help = "Set DLAB_FORCE=1 on the ssh backend")]
     pub force: bool,
 
@@ -65,6 +84,8 @@ impl GlobalArgs {
             artifacts: self.artifacts.clone(),
             goldens: self.goldens.clone(),
             session_ttl: self.session_ttl,
+            forward: self.forward.clone(),
+            app_args: self.app_args.clone(),
             force: self.force,
         }
     }

@@ -9,8 +9,8 @@ use super::executor::{snap_json, Executor, SnapArtifacts};
 use super::{driver_options, driver_run_dir, ensure_surface, probe_backend, terminate};
 use crate::backend;
 use crate::cli::{RunArgs, VerifyArgs};
-use crate::config::{Config, Viewport};
-use crate::driver::{self, Connection};
+use crate::config::{Config, Forward, Viewport};
+use crate::driver::{self, forward, Connection};
 use crate::flow::{Flow, Step};
 use crate::note;
 use crate::output::Summary;
@@ -101,6 +101,13 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
         None => config.viewport,
     };
 
+    let declared_target = args.target.clone().unwrap_or_else(|| flow.target.clone());
+    forward::guard(
+        config,
+        &declared_target,
+        &format!("ui-box run {}", flow_path.display()),
+    )?;
+
     let backend = backend::select(config)?;
     probe_backend(backend.as_ref())?;
 
@@ -117,10 +124,7 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
             None
         }
     };
-    let target = effective_target(
-        args.target.clone().unwrap_or_else(|| flow.target.clone()),
-        placement.as_ref(),
-    );
+    let target = effective_target(declared_target, placement.as_ref());
 
     let spec = driver::resolve(surface, config)?;
     let run = RunDir::create(&config.artifacts)?;
@@ -133,6 +137,7 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
     meta.flow = Some(flow.flow.clone());
     meta.target = Some(target.clone());
     meta.viewport = Some(viewport);
+    meta.forward = config.forward.clone();
     if let Some(placed) = &placement {
         apply_placement(&mut meta, placed);
     }
@@ -158,7 +163,7 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
             meta.ended = Some(now_iso());
             meta.verdict = "error".to_string();
             run.write_meta(&meta)?;
-            return Err(err);
+            return Err(forward::classify(err, config));
         }
     };
 
@@ -259,6 +264,7 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
         "flow_file": flow_path,
         "surface": surface.as_str(),
         "target": target,
+        "forward": config.forward.iter().map(Forward::label).collect::<Vec<String>>(),
         "backend": backend.url(),
         "verdict": meta.verdict,
         "steps_total": meta.steps_total,
