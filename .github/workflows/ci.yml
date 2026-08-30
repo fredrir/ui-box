@@ -120,10 +120,8 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v17
 
+      # Evaluation only; the sandbox build measured 395s, so it runs in nix-build.yml.
       - run: nix flake check --all-systems --no-build --no-write-lock-file
-
-      # flake check only evaluates packages, so the sandbox build needs its own step.
-      - run: nix build --no-link --no-write-lock-file .#ui-box-unwrapped
 
   ci:
     name: ci

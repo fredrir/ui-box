@@ -1,0 +1,48 @@
+name: nix build
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: nix build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v17
+
+      # Nightly rather than per-push: this measured 395s against 48-74s for the rest of ci.
+      - run: >
+          nix build --no-link --no-write-lock-file
+          .#ui-box .#ui-box-dom .#ui-box-unwrapped .#uibox-vision .#tauri-driver
+
+      - name: a failed nightly needs somewhere visible to land
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="nightly nix build is failing"
+          open=$(gh issue list --state open --search "in:title $title" --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Still failing: $RUN_URL"
+          else
+            gh issue create --title "$title" --body "The nightly nix build is failing: $RUN_URL"
+          fi
