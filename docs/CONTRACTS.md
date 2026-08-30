@@ -301,6 +301,28 @@ non-zero as "the UI failed". A non-zero exit forces the summary onto stdout, so
 an exit 1 carrying no parseable JSON line is likewise a broken binary rather
 than a result.
 
+### MCP surface
+
+Frozen for the same reason and separately: an agent reaches ui-box through
+these names, never through argv, and each consuming project names the server
+in its own `.mcp.json`.
+
+    ui_test_prepare  ui_open  ui_act    ui_snap  ui_eval  ui_close
+    ui_record        ui_run   ui_verify ui_runs  ui_show
+
+Eleven tools. Every one accepts `project_dir`, which defaults to the server's
+working directory and is where `uibox.toml`, `.uibox/runs` and relative flow
+paths resolve.
+
+Tool names and parameter names are frozen. Descriptions are NOT: they are prose,
+they are rewritten whenever they can be made shorter, and they cost every
+session that connects whether it calls the tool or not.
+
+Every result carries `status` and `failure_domain`. `failure_domain` separates
+`ui_test_failed` from `uibox_unusable` and is the MCP equivalent of the
+three-valued exit code above -- a consumer that ignores it reproduces §8 exactly,
+by reading "ui-box never ran" as "the UI is fine".
+
 ## 8. Absence read as success
 
 The recurring bug in a verification tool is not a wrong answer. It is a
