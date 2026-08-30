@@ -17,35 +17,27 @@ pub const RUNS: &str = "ui_runs";
 pub const SHOW: &str = "ui_show";
 
 pub const INSTRUCTIONS: &str = "\
-ui-box drives a real UI that runs inside the dlab-ui lab (a NixOS VM with Xvfb, a window
-manager and Playwright browsers) and reports back as text. You stay on this machine; the
-UI does not.
+ui-box drives a real UI inside the dlab-ui lab (a NixOS VM with Xvfb and Playwright) and
+reports back as text. You stay here; the UI does not.
 
-`localhost` in a target is the LAB's loopback, not this machine's. A dev server you
-started here is not on it. Publish the port across with `forward` (the first number is
-the one in your URL, because the URL resolves inside the lab). ui-box refuses a loopback
-target with no matching forward rather than letting the browser load an error page --
-if you see that refusal you have not found an application bug, you have not published
-the port yet.
+`localhost` in a target is the LAB's loopback. A dev server you started here is not on
+it until a forward publishes it: `forward = \"3000:5173\"` in uibox.toml, or UIBOX_FORWARD
+in this server's environment. The first number is the one in your URL, because the URL
+resolves inside the lab. A loopback target with no covering forward is REFUSED -- that
+refusal is not an application bug.
 
-Normal loop: call ui_test_prepare first, then ui_open to get a session, then ui_act /
-ui_snap / ui_eval against that session, then ui_close. Freeze a session you like into a
-committed flow file with ui_record, and replay it later with ui_run.
+Loop: ui_test_prepare, ui_open, then ui_act / ui_snap / ui_eval, then ui_close.
+ui_record freezes a session into a flow file, ui_run replays it, ui_verify is the gate
+the Stop hook runs. project_dir defaults to this server's cwd, which is where uibox.toml,
+.uibox/runs and relative flow paths resolve.
 
-ui_verify runs the same gate the Stop hook runs, so you can fix a regression yourself
-instead of meeting it as a wall at the end of a turn. Read its result carefully: verify
-exits 0 both when every flow passed and when it ran nothing at all.
+Snapshots are accessibility trees as text, and that is what to read. Screenshots come
+back only on request or on failure.
 
-Snapshots are accessibility trees as text, and that is what you should read. Screenshots
-are returned only when you ask for them or when something fails, because images cost far
-more context than they are usually worth.
-
-Every result separates two kinds of failure and you must not confuse them:
-  ui_test_failed   the UI under test failed. ui-box worked. Go debug the application.
-  uibox_unusable   ui-box itself could not run. The UI was never exercised, so nothing
-                   is known about it. Go fix the tooling. Do NOT report an application
-                   bug on the strength of this.
-The structured content of every result carries `status` and `failure_domain` saying which.";
+Every result carries `status` and `failure_domain`:
+  ui_test_failed   the UI failed; ui-box worked. Debug the application.
+  uibox_unusable   ui-box could not run. The UI was never exercised, so nothing is known
+                   about it. Do NOT report an application bug on the strength of this.";
 
 fn object(value: Value) -> Arc<JsonObject> {
     match value {
@@ -54,43 +46,64 @@ fn object(value: Value) -> Arc<JsonObject> {
     }
 }
 
+fn merge(base: Value, extra: Value) -> Value {
+    match (base, extra) {
+        (Value::Object(mut base), Value::Object(extra)) => {
+            base.extend(extra);
+            Value::Object(base)
+        }
+        (base, _) => base,
+    }
+}
+
 fn project_dir() -> Value {
+    json!({ "type": "string" })
+}
+
+fn max_chars() -> Value {
+    json!({ "type": "integer", "minimum": 200 })
+}
+
+fn pipeline() -> Value {
     json!({
-        "type": "string",
-        "description": "Directory to run ui-box from, which is how uibox.toml, .uibox/runs \
-                        and relative flow paths resolve. Defaults to this server's working \
-                        directory, which is normally the project root."
+        "lab": { "type": "string", "description": "Build lab holding the checkout." },
+        "project": { "type": "string" },
+        "build": { "type": "string", "description": "Command run in the build lab." },
+        "artifact": { "type": "string" },
+        "source": { "type": "string", "description": "Synced into the build lab. Default: project root." },
+        "lab_checkout": { "type": "boolean", "description": "Build the lab's checkout, not a synced tree." },
+        "target_lab": { "type": "string", "description": "Default: the backend host." },
+        "no_place": { "type": "boolean", "description": "Skip build and place; replay as-is." },
+        "keep_going": { "type": "boolean" },
+        "force": { "type": "boolean", "description": "DLAB_FORCE=1 on the ssh backend." },
+        "project_dir": project_dir()
     })
 }
 
 fn tool(name: &'static str, description: &'static str, schema: Value, read_only: bool) -> Tool {
-    let mut annotations = ToolAnnotations::default();
-    annotations.read_only_hint = Some(read_only);
-    annotations.open_world_hint = Some(true);
-    Tool::new(
+    let tool = Tool::new(
         Cow::Borrowed(name),
         Cow::Borrowed(description),
         object(schema),
-    )
-    .with_annotations(annotations)
+    );
+    match read_only {
+        true => tool.with_annotations(ToolAnnotations::new().read_only(true)),
+        false => tool,
+    }
 }
 
 pub fn tools() -> Vec<Tool> {
     vec![
         tool(
             PREPARE,
-            "Wake the lab that hosts the UI and check that ui-box can actually drive it. \
-             Call this once before the first ui_open in a session of work. It returns ready, \
-             or the specific reason it is not ready. Checks ui-box marks advisory, such as the \
-             golden store, are reported but do not block the live loop. Artifact placement \
-             itself happens in ui_run, which builds and copies the artifact into the lab as \
-             part of a replay.",
+            "Wake the lab and check ui-box can drive it. Call once before the first ui_open. \
+             Advisory failures (golden store) do not block.",
             json!({
                 "type": "object",
                 "properties": {
-                    "lab": { "type": "string", "description": "Lab to wake. Defaults to the backend host from UIBOX_BACKEND." },
-                    "force": { "type": "boolean", "description": "Set DLAB_FORCE=1 on the ssh backend, forcing a lab that refuses to start." },
-                    "wait": { "type": "integer", "minimum": 0, "description": "Seconds to wait for the wake before moving on. Default 2." },
+                    "lab": { "type": "string", "description": "Defaults to UIBOX_BACKEND." },
+                    "force": { "type": "boolean", "description": "Forces a lab that refuses to start (DLAB_FORCE=1)." },
+                    "wait": { "type": "integer", "minimum": 0, "description": "Seconds. Default 2." },
                     "project_dir": project_dir()
                 },
                 "additionalProperties": false
@@ -99,19 +112,17 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             OPEN,
-            "Open a live session against a target and keep the driver running. Returns a \
-             session id used by ui_act, ui_snap, ui_eval and ui_close, and by default also \
-             returns the initial accessibility snapshot so you can see what rendered without \
-             a second call. An empty initial snapshot is reported as a failure, not a pass.",
+            "Open a live session. Returns its id and the initial accessibility snapshot. \
+             An empty snapshot is a failure, never a pass.",
             json!({
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "http://host:3000, exec:/path/to/bin or tui:name. Defaults to UIBOX_TARGET or target in uibox.toml." },
-                    "surface": { "type": "string", "enum": ["web", "tauri", "tui"], "description": "Defaults to web." },
-                    "viewport": { "type": "string", "pattern": "^[0-9]+x[0-9]+$", "description": "WxH, for example 1280x800." },
-                    "flow": { "type": "string", "description": "Flow name recorded in meta.json, which ui_record then reuses." },
-                    "snapshot": { "type": "boolean", "description": "Take an accessibility snapshot right after opening. Default true." },
-                    "max_chars": { "type": "integer", "minimum": 200, "description": "Cap on inlined snapshot text. Default 20000." },
+                    "target": { "type": "string", "description": "http://host:3000, exec:/path/to/bin or tui:name. Default from UIBOX_TARGET or uibox.toml." },
+                    "surface": { "type": "string", "enum": ["web", "tauri", "tui"], "description": "Default web." },
+                    "viewport": { "type": "string", "pattern": "^[0-9]+x[0-9]+$" },
+                    "flow": { "type": "string", "description": "Flow name ui_record reuses." },
+                    "snapshot": { "type": "boolean" },
+                    "max_chars": max_chars(),
                     "project_dir": project_dir()
                 },
                 "additionalProperties": false
@@ -120,32 +131,29 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             ACT,
-            "Send one step, or a list of steps, to a live session. Give either the flat form \
-             (action plus its argument) or `steps` for a batch; a batch stops at the first \
-             step that fails. When a step fails, an accessibility snapshot, a screenshot and \
-             any console errors or failed network requests are collected automatically and \
-             returned with the failure, because those are what explain it.",
+            "One step from the flat fields, or `steps` for a batch that halts at the first \
+             failure.",
             json!({
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string", "description": "Session id from ui_open." },
+                    "session": { "type": "string" },
                     "action": {
                         "type": "string",
                         "enum": ["open", "click", "type", "key", "wait_for", "assert_text", "snap"],
-                        "description": "The step verb. Ignored when `steps` is given."
+                        "description": "By verb: click/wait_for/assert_text -> selector; type -> selector+text; key -> key; open -> target; snap -> name. Ignored with `steps`."
                     },
-                    "selector": { "type": "string", "description": "Selector for click, type, wait_for and assert_text. Grammar: css=SEL, role=ROLE, text=STR (all surfaces), re=REGEX and cell=R,C (tui only)." },
-                    "text": { "type": "string", "description": "Text to type, for action=type." },
-                    "target": { "type": "string", "description": "Target for action=open." },
-                    "key": { "type": "string", "description": "Key for action=key, for example Enter." },
-                    "name": { "type": "string", "description": "Snapshot name for action=snap." },
+                    "selector": { "type": "string", "description": "css=SEL, role=ROLE, text=STR; tui also re=REGEX and cell=R,C." },
+                    "text": { "type": "string" },
+                    "target": { "type": "string" },
+                    "key": { "type": "string" },
+                    "name": { "type": "string" },
                     "steps": {
                         "type": "array",
-                        "description": "A batch of steps, run in order until one fails. Each element is either the flat form {\"action\":\"click\",\"selector\":\"...\"} or a raw step node {\"click\":\"role=button[name=Submit]\"}.",
+                        "description": "Flat [{\"action\":\"click\",\"selector\":\"...\"}], or raw one-verb nodes [{\"click\":\"role=button[name=Submit]\"}] which also reach verbs `action` lacks, such as assert_absent.",
                         "items": { "type": "object" }
                     },
-                    "snapshot_on_failure": { "type": "boolean", "description": "Collect a snapshot and screenshot when a step fails. Default true." },
-                    "max_chars": { "type": "integer", "minimum": 200, "description": "Cap on inlined snapshot text. Default 20000." },
+                    "snapshot_on_failure": { "type": "boolean" },
+                    "max_chars": max_chars(),
                     "project_dir": project_dir()
                 },
                 "required": ["session"],
@@ -155,18 +163,16 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             SNAP,
-            "Snapshot a live session. Returns the accessibility tree as text, which is what \
-             you should read, plus any console errors and failed network requests recorded \
-             since the last call. Ask for mode png or both, or set include_image, to also get \
-             the screenshot back as an image. An empty snapshot is reported as a failure.",
+            "Accessibility tree as text, with console errors and failed requests since the \
+             last call. An empty snapshot is a failure, never a pass.",
             json!({
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string", "description": "Session id from ui_open." },
-                    "name": { "type": "string", "description": "Name for the snapshot file under <run>/snaps/." },
+                    "session": { "type": "string" },
+                    "name": { "type": "string" },
                     "mode": { "type": "string", "enum": ["text", "png", "both"], "description": "Default text." },
-                    "include_image": { "type": "boolean", "description": "Return the screenshot as an image block. Promotes mode text to both." },
-                    "max_chars": { "type": "integer", "minimum": 200, "description": "Cap on inlined snapshot text. Default 20000." },
+                    "include_image": { "type": "boolean", "description": "Inline the screenshot; promotes mode text to both." },
+                    "max_chars": max_chars(),
                     "project_dir": project_dir()
                 },
                 "required": ["session"],
@@ -176,14 +182,13 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             EVAL,
-            "Evaluate an expression inside a live session and return its value. Use this for \
-             the things a snapshot cannot tell you, such as application state or a computed \
-             style. It does not record a step, so it never appears in a recorded flow.",
+            "Evaluate an expression in a live session, for what the accessibility tree cannot \
+             show. Records no step, so it never enters a flow.",
             json!({
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string", "description": "Session id from ui_open." },
-                    "expr": { "type": "string", "description": "Expression evaluated by the driver for this surface." },
+                    "session": { "type": "string" },
+                    "expr": { "type": "string", "description": "JavaScript on web and tauri." },
                     "project_dir": project_dir()
                 },
                 "required": ["session", "expr"],
@@ -193,14 +198,12 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             CLOSE,
-            "Close a live session and release its driver. The run directory survives, so the \
-             session can still be recorded with ui_record or inspected with ui_show. Returns \
-             the run's verdict and how many steps failed.",
+            "Close a live session. The run survives for ui_record and ui_show.",
             json!({
                 "type": "object",
                 "properties": {
-                    "session": { "type": "string", "description": "Session id from ui_open." },
-                    "keep_channel": { "type": "boolean", "description": "Keep the driver channel directory and its log for debugging." },
+                    "session": { "type": "string" },
+                    "keep_channel": { "type": "boolean", "description": "Keeps the driver channel dir and its log." },
                     "project_dir": project_dir()
                 },
                 "required": ["session"],
@@ -210,17 +213,16 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             RECORD,
-            "Freeze a session you explored into a replayable flow file. Every step that landed \
-             was already appended as it happened, so this works on a session that is still open \
-             as well as on a finished run. Write it into the repository and ui_run replays it.",
+            "Freeze a session into a flow file. Steps were appended as they landed, so an \
+             open session records as well as a finished run.",
             json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "Session id, or the run id they share." },
-                    "format": { "type": "string", "enum": ["uibox", "playwright"], "description": "Default uibox, the step format ui_run replays. playwright emits a spec file instead." },
-                    "out": { "type": "string", "description": "Where to write it, for example flows/checkout.yaml. Defaults to flow.yaml inside the run directory. Use - to get the file contents back in the result instead." },
-                    "flow": { "type": "string", "description": "Flow name to record. Defaults to the name given at ui_open." },
-                    "target": { "type": "string", "description": "Override the target recorded in the flow." },
+                    "id": { "type": "string", "description": "Session id or run id." },
+                    "format": { "type": "string", "enum": ["uibox", "playwright"], "description": "Default uibox, what ui_run replays; playwright emits a spec file." },
+                    "out": { "type": "string", "description": "flows/checkout.yaml. Default: flow.yaml in the run dir. `-` returns contents." },
+                    "flow": { "type": "string", "description": "Defaults to the ui_open name." },
+                    "target": { "type": "string", "description": "Override the recorded target." },
                     "project_dir": project_dir()
                 },
                 "required": ["id"],
@@ -230,77 +232,48 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             RUN,
-            "Replay a saved flow end to end and return its verdict. With an artifact this also \
-             builds and places it into the target lab before replaying, which is the full \
-             check of a change. On failure it reports the step it halted at together with the \
-             last snapshot, console errors and failed network requests.",
+            "Replay a saved flow and return its verdict. With `artifact` it first builds and \
+             places it into the target lab: the full check of a change.",
             json!({
                 "type": "object",
-                "properties": {
-                    "flow": { "type": "string", "description": "Path to a step-format yaml file, for example flows/checkout.yaml." },
-                    "lab": { "type": "string", "description": "Build lab holding the checkout under test." },
-                    "project": { "type": "string" },
-                    "build": { "type": "string", "description": "Build command to run in the build lab." },
-                    "artifact": { "type": "string", "description": "Artifact path to place into the target lab. Without it the flow replays against the target as it stands." },
-                    "source": { "type": "string", "description": "Local tree synced into the build lab. Defaults to the project root, which is what you want when testing uncommitted work." },
-                    "lab_checkout": { "type": "boolean", "description": "Build from the lab's own checkout instead of syncing a local tree." },
-                    "target_lab": { "type": "string", "description": "Lab the artifact is placed into. Defaults to the backend host." },
+                "properties": merge(pipeline(), json!({
+                    "flow": { "type": "string", "description": "e.g. flows/checkout.yaml." },
                     "surface": { "type": "string", "enum": ["web", "tauri", "tui"] },
                     "target": { "type": "string", "description": "Override the flow's target." },
                     "viewport": { "type": "string", "pattern": "^[0-9]+x[0-9]+$" },
-                    "no_place": { "type": "boolean", "description": "Skip the pipeline and replay against the target as it stands." },
-                    "keep_going": { "type": "boolean", "description": "Keep running after a failing step instead of halting." },
-                    "force": { "type": "boolean", "description": "Set DLAB_FORCE=1 on the ssh backend." },
-                    "include_image": { "type": "boolean", "description": "Return the last screenshot the flow took as an image block." },
-                    "max_chars": { "type": "integer", "minimum": 200, "description": "Cap on inlined snapshot text. Default 20000." },
-                    "project_dir": project_dir()
-                },
+                    "include_image": { "type": "boolean" },
+                    "max_chars": max_chars()
+                })),
                 "additionalProperties": false
             }),
             false,
         ),
         tool(
             VERIFY,
-            "Replay every committed flow and compare its screenshots against the approved \
-             goldens. This is the same gate the Stop hook runs, so running it yourself lets you \
-             fix a visual regression before it blocks you.\n\n\
-             READ THE RESULT, NOT JUST THE EXIT: verify is quiet when there is nothing to do. \
-             It skips when --since says the tree has not moved, and when no flow files exist. \
-             In those cases it still succeeds while having exercised no UI at all, and the \
-             result comes back with status `nothing_verified` rather than `passed`. A \
-             `nothing_verified` result proves nothing about your UI; it means no work was \
-             done. Only `passed` means flows actually ran and matched their goldens.",
+            "Replay every committed flow and diff its screenshots against the approved \
+             goldens.\n\
+             READ THE STATUS, NOT THE EXIT: with no flow files, or a `since` the tree has not \
+             moved past, verify succeeds having run nothing -- status `nothing_verified`, which \
+             proves nothing. Only `passed` means flows ran and matched.",
             json!({
                 "type": "object",
-                "properties": {
-                    "since": { "type": "string", "description": "Git ref. Verify only if the tree moved since it, otherwise skip. Skipping returns nothing_verified, not a pass." },
-                    "flows": { "type": "string", "description": "Directory holding the flow files. Defaults to flows/." },
-                    "update_goldens": { "type": "boolean", "description": "Approve every candidate screenshot as the new golden. This REWRITES the golden store and makes the comparison pass by definition, so only do it when you have looked at the differences and decided the new rendering is correct." },
-                    "golden_prefix": { "type": "string", "description": "Golden name prefix. Defaults to project/flow." },
-                    "lab": { "type": "string", "description": "Build lab holding the checkout under test." },
-                    "project": { "type": "string" },
-                    "build": { "type": "string", "description": "Build command to run in the build lab." },
-                    "artifact": { "type": "string", "description": "Artifact to place into the target lab before replaying." },
-                    "source": { "type": "string", "description": "Local tree synced into the build lab. Defaults to the project root." },
-                    "lab_checkout": { "type": "boolean", "description": "Build from the lab's own checkout instead of syncing a local tree." },
-                    "target_lab": { "type": "string", "description": "Lab the artifact is placed into." },
-                    "no_place": { "type": "boolean", "description": "Skip the pipeline and replay against the target as it stands." },
-                    "keep_going": { "type": "boolean", "description": "Keep running after a failing step instead of halting." },
-                    "force": { "type": "boolean", "description": "Set DLAB_FORCE=1 on the ssh backend." },
-                    "project_dir": project_dir()
-                },
+                "properties": merge(pipeline(), json!({
+                    "since": { "type": "string", "description": "Git ref. Skip unless the tree moved past it; a skip is nothing_verified, not a pass." },
+                    "flows": { "type": "string", "description": "Default flows/." },
+                    "update_goldens": { "type": "boolean", "description": "Approve every candidate as the new golden. REWRITES the store and passes by definition -- only after reading the diffs." },
+                    "golden_prefix": { "type": "string", "description": "Default project/flow." }
+                })),
                 "additionalProperties": false
             }),
             false,
         ),
         tool(
             RUNS,
-            "List recorded runs, newest first, with each run's verdict and how many steps \
-             failed. Use it to find the run id that ui_show or ui_record needs.",
+            "Recorded runs, newest first, with verdict and failed step count.",
             json!({
                 "type": "object",
                 "properties": {
-                    "limit": { "type": "integer", "minimum": 1, "description": "How many runs to list. Default 20." },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Default 20." },
                     "project_dir": project_dir()
                 },
                 "additionalProperties": false
@@ -309,15 +282,14 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             SHOW,
-            "Show one recorded run: its provenance and verdict, the steps that landed, the \
-             golden comparison report, and the snapshot files. Console errors and failed \
-             network requests recorded during the run are returned alongside.",
+            "One recorded run: provenance, verdict, steps, golden report, snapshots, console \
+             and network errors.",
             json!({
                 "type": "object",
                 "properties": {
-                    "run": { "type": "string", "description": "Run id, as listed by ui_runs." },
+                    "run": { "type": "string" },
                     "what": { "type": "string", "enum": ["meta", "steps", "report", "snaps", "all"], "description": "Default meta." },
-                    "max_chars": { "type": "integer", "minimum": 200, "description": "Cap on inlined snapshot text. Default 20000." },
+                    "max_chars": max_chars(),
                     "project_dir": project_dir()
                 },
                 "required": ["run"],
@@ -326,4 +298,116 @@ pub fn tools() -> Vec<Tool> {
             true,
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FROZEN: &[(&str, &[&str])] = &[
+        (PREPARE, &["force", "lab", "project_dir", "wait"]),
+        (
+            OPEN,
+            &[
+                "flow",
+                "max_chars",
+                "project_dir",
+                "snapshot",
+                "surface",
+                "target",
+                "viewport",
+            ],
+        ),
+        (
+            ACT,
+            &[
+                "action",
+                "key",
+                "max_chars",
+                "name",
+                "project_dir",
+                "selector",
+                "session",
+                "snapshot_on_failure",
+                "steps",
+                "target",
+                "text",
+            ],
+        ),
+        (
+            SNAP,
+            &[
+                "include_image",
+                "max_chars",
+                "mode",
+                "name",
+                "project_dir",
+                "session",
+            ],
+        ),
+        (EVAL, &["expr", "project_dir", "session"]),
+        (CLOSE, &["keep_channel", "project_dir", "session"]),
+        (
+            RECORD,
+            &["flow", "format", "id", "out", "project_dir", "target"],
+        ),
+        (
+            RUN,
+            &[
+                "artifact",
+                "build",
+                "flow",
+                "force",
+                "include_image",
+                "keep_going",
+                "lab",
+                "lab_checkout",
+                "max_chars",
+                "no_place",
+                "project",
+                "project_dir",
+                "source",
+                "surface",
+                "target",
+                "target_lab",
+                "viewport",
+            ],
+        ),
+        (
+            VERIFY,
+            &[
+                "artifact",
+                "build",
+                "flows",
+                "force",
+                "golden_prefix",
+                "keep_going",
+                "lab",
+                "lab_checkout",
+                "no_place",
+                "project",
+                "project_dir",
+                "since",
+                "source",
+                "target_lab",
+                "update_goldens",
+            ],
+        ),
+        (RUNS, &["limit", "project_dir"]),
+        (SHOW, &["max_chars", "project_dir", "run", "what"]),
+    ];
+
+    #[test]
+    fn the_frozen_tool_and_parameter_names_are_still_what_contracts_says() {
+        let tools = tools();
+        assert_eq!(tools.len(), FROZEN.len());
+        for (tool, (name, parameters)) in tools.iter().zip(FROZEN) {
+            assert_eq!(&tool.name, name);
+            let properties = tool.input_schema["properties"]
+                .as_object()
+                .expect("properties is an object");
+            let found: Vec<&str> = properties.keys().map(String::as_str).collect();
+            assert_eq!(&found, parameters, "{name} parameters moved");
+        }
+    }
 }
