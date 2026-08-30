@@ -1,7 +1,6 @@
 import { type Server, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { PNG } from "pngjs";
-import { W3C_ELEMENT_KEY } from "../webdriver/client.js";
 
 export interface RecordedRequest {
   method: string;
@@ -15,6 +14,8 @@ export interface FakeWebDriver {
   scripts: string[];
   close(): Promise<void>;
 }
+
+export const PROTOCOL_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
 
 const SNAPSHOT = ['- heading "Tauri Lab" [level=1]', '- button "Submit"'].join("\n");
 
@@ -60,7 +61,7 @@ export async function startFakeWebDriver(): Promise<FakeWebDriver> {
       if (rest === "/actions") return reply(null);
       if (rest === "/screenshot") return reply(screenshotBase64(1280, 800));
       if (rest === "/element") {
-        return reply({ [W3C_ELEMENT_KEY]: "e1" });
+        return reply({ [PROTOCOL_ELEMENT_KEY]: "e1" });
       }
       if (/^\/element\/e1\/(click|clear|value)$/.test(rest)) return reply(null);
       if (rest === "/execute/sync") {

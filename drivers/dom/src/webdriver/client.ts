@@ -1,6 +1,6 @@
 import { DriverError, RPC_ATTACH_FAILED } from "../errors.js";
 
-export const W3C_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecc";
+export const W3C_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf";
 
 interface W3cEnvelope<T> {
   value: T;
