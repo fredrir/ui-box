@@ -261,7 +261,7 @@ esac
 say "  Remote backend (ssh://): ready."
 say "    The driver runs on the lab host, where the display is; these binaries"
 say "    are the client that drives it over ssh."
-say "      export UIBOX_BACKEND=ssh://fredrir@dlab-ui"
+say "      export UIBOX_BACKEND=ssh://fredrir@ui-box-backend"
 say ""
 
 if [ -n "$DOM" ] && [ -n "$VISION" ]; then

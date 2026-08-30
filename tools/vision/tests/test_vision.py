@@ -213,8 +213,8 @@ def _run_dir(tmp_path: Path) -> Path:
         json.dumps(
             {
                 "project": "shop",
-                "lab": "dlab-ui",
-                "backend": "ssh://fredrir@dlab-ui",
+                "lab": "ui-box-backend",
+                "backend": "ssh://fredrir@ui-box-backend",
                 "surface": "web",
                 "git_sha": "abc123",
                 "diff_hash": "0" * 8,

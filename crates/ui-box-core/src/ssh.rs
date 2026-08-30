@@ -73,8 +73,8 @@ impl SshBackend {
 
     fn environment(&self, cmd: &Cmd) -> Vec<(String, String)> {
         let mut env = cmd.env.clone();
-        if self.force && !env.iter().any(|(key, _)| key == "DLAB_FORCE") {
-            env.push(("DLAB_FORCE".to_string(), "1".to_string()));
+        if self.force && !env.iter().any(|(key, _)| key == "UIBOX_FORCE") {
+            env.push(("UIBOX_FORCE".to_string(), "1".to_string()));
         }
         env
     }
@@ -94,7 +94,7 @@ impl SshBackend {
 
     fn invoke(&self, mut command: Command, context: String) -> Result<Output> {
         if self.force {
-            command.env("DLAB_FORCE", "1");
+            command.env("UIBOX_FORCE", "1");
         }
         let output = command
             .output()
@@ -277,7 +277,7 @@ fn wake_command(lab: &str, force: bool, hop: Option<&str>) -> Command {
         }
         None => {
             if force {
-                command.env("DLAB_FORCE", "1");
+                command.env("UIBOX_FORCE", "1");
             }
             command.arg(lab).arg("true");
         }
@@ -287,7 +287,7 @@ fn wake_command(lab: &str, force: bool, hop: Option<&str>) -> Command {
 
 fn forced_probe(lab: &str) -> String {
     format!(
-        "DLAB_FORCE=1 ssh -o BatchMode=yes -o LogLevel=ERROR {} true",
+        "UIBOX_FORCE=1 ssh -o BatchMode=yes -o LogLevel=ERROR {} true",
         shell_quote(lab)
     )
 }
@@ -369,7 +369,7 @@ mod tests {
         SshBackend::new(
             BackendSpec::Ssh {
                 user: Some("fredrir".into()),
-                host: "dlab-ui".into(),
+                host: "ui-box-backend".into(),
             },
             force,
         )
@@ -389,9 +389,9 @@ mod tests {
     }
 
     #[test]
-    fn force_sets_dlab_force() {
+    fn force_sets_uibox_force() {
         let script = backend(true).script(&Cmd::new("true"));
-        assert_eq!(script, "DLAB_FORCE=1 true");
+        assert_eq!(script, "UIBOX_FORCE=1 true");
     }
 
     #[test]
@@ -399,17 +399,16 @@ mod tests {
         assert_eq!(backend(false).script(&Cmd::new("true")), "true");
     }
 
-    const RESOLVED: &str = "host dlab-ui\nuser fredrir\nhostname dlab-ui\nproxycommand ssh -T -o LogLevel=ERROR archie /home/fredrir/projects/distro-lab/src/vm/bin/dlab-ssh-proxy %h %p\n";
+    const RESOLVED: &str = "host ui-box-backend\nuser fredrir\nhostname ui-box-backend\nproxycommand ssh -T -o LogLevel=ERROR archie /home/fredrir/packages/ui-box/backend/bin/ui-box-wake %h %p\n";
 
     #[test]
-    fn finds_the_hop_the_dlab_proxy_runs_on() {
+    fn finds_the_hop_the_wake_proxy_runs_on() {
         assert_eq!(parse_proxy_hop(RESOLVED).as_deref(), Some("archie"));
     }
 
     #[test]
     fn treats_a_local_proxy_as_no_hop() {
-        let resolved =
-            "proxycommand /home/fredrir/projects/distro-lab/src/vm/bin/dlab-ssh-proxy %h %p\n";
+        let resolved = "proxycommand /home/fredrir/packages/ui-box/backend/bin/ui-box-wake %h %p\n";
         assert_eq!(parse_proxy_hop(resolved), None);
         assert_eq!(parse_proxy_hop("hostname archie\n"), None);
         assert_eq!(parse_proxy_hop("proxycommand none\n"), None);
@@ -425,8 +424,8 @@ mod tests {
     #[test]
     fn forced_probe_sets_the_variable_where_the_proxy_reads_it() {
         assert_eq!(
-            forced_probe("dlab-ui"),
-            "DLAB_FORCE=1 ssh -o BatchMode=yes -o LogLevel=ERROR dlab-ui true"
+            forced_probe("ui-box-backend"),
+            "UIBOX_FORCE=1 ssh -o BatchMode=yes -o LogLevel=ERROR ui-box-backend true"
         );
     }
 }

@@ -17,7 +17,7 @@ pub const RUNS: &str = "ui_runs";
 pub const SHOW: &str = "ui_show";
 
 pub const INSTRUCTIONS: &str = "\
-ui-box drives a real UI inside the dlab-ui lab (a NixOS VM with Xvfb and Playwright) and
+ui-box drives a real UI inside the ui-box-backend lab (a NixOS VM with Xvfb and Playwright) and
 reports back as text. You stay here; the UI does not.
 
 `localhost` in a target is the LAB's loopback. A dev server you started here is not on
@@ -82,7 +82,7 @@ fn pipeline() -> Value {
         "target_lab": { "type": "string", "description": "Default: the backend host." },
         "no_place": { "type": "boolean", "description": "Skip build and place; replay as-is." },
         "keep_going": { "type": "boolean" },
-        "force": { "type": "boolean", "description": "DLAB_FORCE=1 on the ssh backend." },
+        "force": { "type": "boolean", "description": "UIBOX_FORCE=1 on the ssh backend." },
         "project_dir": project_dir()
     })
 }
@@ -109,7 +109,7 @@ pub fn tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "lab": { "type": "string", "description": "Defaults to UIBOX_BACKEND." },
-                    "force": { "type": "boolean", "description": "Forces a lab that refuses to start (DLAB_FORCE=1)." },
+                    "force": { "type": "boolean", "description": "Forces a lab that refuses to start (UIBOX_FORCE=1)." },
                     "wait": { "type": "integer", "minimum": 0, "description": "Seconds. Default 2." },
                     "project_dir": project_dir()
                 },

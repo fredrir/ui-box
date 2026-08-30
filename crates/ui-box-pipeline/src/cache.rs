@@ -82,8 +82,8 @@ mod tests {
                 artifact_hash: "ghi".to_string(),
             },
             remote_path: PathBuf::from("/nix/store/x-app/bin/app"),
-            lab: "dlab-archtex".to_string(),
-            target: "dlab-ui".to_string(),
+            lab: "build-lab".to_string(),
+            target: "ui-box-backend".to_string(),
         }
     }
 
@@ -96,16 +96,16 @@ mod tests {
 
     #[test]
     fn accepts_the_same_tree_on_the_same_pair_of_labs() {
-        assert!(record().matches(&source("abc", "def"), "dlab-archtex", "dlab-ui"));
+        assert!(record().matches(&source("abc", "def"), "build-lab", "ui-box-backend"));
     }
 
     #[test]
     fn rejects_a_dirty_tree_at_the_same_commit() {
-        assert!(!record().matches(&source("abc", "changed"), "dlab-archtex", "dlab-ui"));
+        assert!(!record().matches(&source("abc", "changed"), "build-lab", "ui-box-backend"));
     }
 
     #[test]
     fn rejects_a_different_target_lab() {
-        assert!(!record().matches(&source("abc", "def"), "dlab-archtex", "dlab-nsql"));
+        assert!(!record().matches(&source("abc", "def"), "build-lab", "other-lab"));
     }
 }

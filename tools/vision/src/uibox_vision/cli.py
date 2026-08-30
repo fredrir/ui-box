@@ -8,7 +8,7 @@ from typing import Any, Sequence
 from . import __version__
 from .emit import VisionError, emit, emit_error
 
-DEFAULT_STORE = "/var/lib/dlab-state/ui-box/goldens.git"
+DEFAULT_STORE = "/var/lib/ui-box-state/ui-box/goldens.git"
 
 
 def _store(value: str | None) -> str:

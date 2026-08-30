@@ -101,7 +101,7 @@ impl Mediator {
 pub fn forced(command: &str, force: Option<&str>) -> String {
     match force {
         Some(value) if !value.trim().is_empty() => {
-            format!("DLAB_FORCE={} {}", sh::quote(value.trim()), command)
+            format!("UIBOX_FORCE={} {}", sh::quote(value.trim()), command)
         }
         _ => command.to_string(),
     }
@@ -112,7 +112,7 @@ pub fn wake(via: &Mediator, lab: &str) -> Result<()> {
         Mediator::Here => local("ssh", &[lab.to_string(), "true".to_string()])?,
         Mediator::Over(hop) => {
             let inner = format!("ssh {} true", sh::quote(lab));
-            let force = std::env::var("DLAB_FORCE").ok();
+            let force = std::env::var("UIBOX_FORCE").ok();
             let script = forced(&inner, force.as_deref());
             local("ssh", &[hop.clone(), script])?
         }
@@ -238,13 +238,13 @@ mod hop_tests {
 
     #[test]
     fn finds_the_hop_in_the_remote_workstation_config() {
-        let proxycommand = "ssh -T -o LogLevel=ERROR archie /home/fredrir/projects/distro-lab/src/vm/bin/dlab-ssh-proxy %h %p";
+        let proxycommand = "ssh -T -o LogLevel=ERROR archie /home/fredrir/packages/ui-box/backend/bin/ui-box-wake %h %p";
         assert_eq!(parse_proxy_hop(proxycommand), Some("archie".to_string()));
     }
 
     #[test]
     fn finds_no_hop_when_the_proxy_runs_locally() {
-        let proxycommand = "/home/fredrir/projects/distro-lab/src/vm/bin/dlab-ssh-proxy %h %p";
+        let proxycommand = "/home/fredrir/packages/ui-box/backend/bin/ui-box-wake %h %p";
         assert_eq!(parse_proxy_hop(proxycommand), None);
     }
 
@@ -259,15 +259,21 @@ mod hop_tests {
     #[test]
     fn carries_the_force_flag_over_the_hop() {
         assert_eq!(
-            forced("ssh dlab-ui true", Some("1")),
-            "DLAB_FORCE='1' ssh dlab-ui true"
+            forced("ssh ui-box-backend true", Some("1")),
+            "UIBOX_FORCE='1' ssh ui-box-backend true"
         );
     }
 
     #[test]
     fn leaves_the_command_alone_when_force_is_unset() {
-        assert_eq!(forced("ssh dlab-ui true", None), "ssh dlab-ui true");
-        assert_eq!(forced("ssh dlab-ui true", Some("  ")), "ssh dlab-ui true");
+        assert_eq!(
+            forced("ssh ui-box-backend true", None),
+            "ssh ui-box-backend true"
+        );
+        assert_eq!(
+            forced("ssh ui-box-backend true", Some("  ")),
+            "ssh ui-box-backend true"
+        );
     }
 
     #[test]

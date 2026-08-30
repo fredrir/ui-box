@@ -43,7 +43,7 @@ A driver that omits the field has not said "no" -- it has said nothing. Per §8 
 consumer must report that as unknown, never as a pass.
 
 DRIVER LOCALITY. The driver runs WHERE THE DISPLAY IS, which for the primary
-workflow is dlab-ui, not the invoking Mac. When the backend is `ssh://`, the
+workflow is ui-box-backend, not the invoking Mac. When the backend is `ssh://`, the
 core spawns the driver through it -- `ssh <host> ui-box-dom`, JSON-RPC over that
 stdio. The transport is verified working. Two things follow and neither is
 optional:
@@ -135,16 +135,16 @@ artifact_hash, started, ended, verdict, steps_total, steps_failed.
 
 Precedence: CLI flag > environment > project uibox.toml > global .env.
 
-    UIBOX_BACKEND      ssh://fredrir@dlab-ui | local://
+    UIBOX_BACKEND      ssh://fredrir@ui-box-backend | local://
     UIBOX_DISPLAY      1280x800x24
     UIBOX_ARTIFACTS    .uibox/runs
-    UIBOX_GOLDENS      /var/lib/dlab-state/ui-box/goldens.git
+    UIBOX_GOLDENS      /var/lib/ui-box-state/ui-box/goldens.git
     UIBOX_SESSION_TTL  900
     UIBOX_FORWARD      3000  |  3000:5173  |  3000:localhost:5173  (repeatable)
     UIBOX_TAURI_DRIVER path to tauri-driver, on the DRIVER's host
     UIBOX_NATIVE_DRIVER path to WebKitWebDriver, on the DRIVER's host
 
-`--force` sets DLAB_FORCE=1 on the ssh backend. When the dlab ssh proxy
+`--force` sets UIBOX_FORCE=1 on the ssh backend. When the waking proxy
 refuses to start a lab, its stderr is propagated verbatim, never wrapped.
 
 FORWARDING. `localhost` in a target is the DRIVER HOST's loopback, not the
@@ -192,7 +192,7 @@ tree under test. The primary workflow is a local checkout on the Mac, an agent
 that never leaves it, and a Linux artifact that cannot be produced there -- so
 `place()` syncs the tree into the build lab before building:
 
-    macie worktree  --rsync-->  build lab  --nix copy-->  dlab-ui
+    macie worktree  --rsync-->  build lab  --nix copy-->  ui-box-backend
 
 The sync destination is a STAGING path, `~/.uibox/src/<project>/` in the build
 lab. It must never be the lab's own checkout: distro-lab already clones each
@@ -220,7 +220,7 @@ worth the complexity.
 
 The `&dyn Backend` handed to `place()` is the BUILD environment -- the one
 holding `req.lab`'s checkout, where the build command runs. It is NOT the
-dlab-ui backend. `req.target` names the lab the artifact is placed into, and
+ui-box-backend backend. `req.target` names the lab the artifact is placed into, and
 `UIBOX_BACKEND` from §4 refers to that target, not to the build lab. `ui-box`
 constructs the build backend for `req.lab` and passes it in; the pipeline never
 needs a second `Backend` object, because the copy is expressed as lab names run
@@ -243,12 +243,12 @@ pipeline. The pipeline calls only `run` and `pull` and imports nothing from
 `spec`, which is what makes the layering real rather than asserted.
 
 Artifact transfer is HOST-MEDIATED, not lab-to-lab. A build lab has no ssh key
-and no dlab ssh config for any other lab -- base.nix authorises only personal
+and no ssh config for any other lab -- base.nix authorises only personal
 keys, and the waking ProxyCommand is symlinked into the host's ~/.ssh/config.d
 only. So a lab cannot reach, let alone wake, another lab. The copy therefore
 runs on the host that already reaches both:
 
-    nix copy --no-check-sigs --from ssh://<build-lab> --to ssh://dlab-ui <paths>
+    nix copy --no-check-sigs --from ssh://<build-lab> --to ssh://ui-box-backend <paths>
 
 Prefer archie as that host when it is the ssh hop anyway; it shares a LAN with
 both labs, where the Mac would stream every byte twice over the slower link.

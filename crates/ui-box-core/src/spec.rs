@@ -74,17 +74,17 @@ mod tests {
     fn parses_backend_urls() {
         assert_eq!(BackendSpec::parse("local://").unwrap(), BackendSpec::Local);
         assert_eq!(
-            BackendSpec::parse("ssh://fredrir@dlab-ui").unwrap(),
+            BackendSpec::parse("ssh://fredrir@ui-box-backend").unwrap(),
             BackendSpec::Ssh {
                 user: Some("fredrir".into()),
-                host: "dlab-ui".into()
+                host: "ui-box-backend".into()
             }
         );
         assert_eq!(
-            BackendSpec::parse("dlab-ui").unwrap(),
+            BackendSpec::parse("ui-box-backend").unwrap(),
             BackendSpec::Ssh {
                 user: None,
-                host: "dlab-ui".into()
+                host: "ui-box-backend".into()
             }
         );
         assert!(BackendSpec::parse("ftp://host").is_err());

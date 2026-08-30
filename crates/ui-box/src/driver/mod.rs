@@ -180,9 +180,11 @@ mod tests {
 
     #[test]
     fn an_explicit_ssh_command_is_its_own_transport() {
-        assert!(carries_own_transport(&words("ssh dlab-ui ui-box-dom")));
         assert!(carries_own_transport(&words(
-            "/usr/bin/ssh dlab-ui ui-box-dom"
+            "ssh ui-box-backend ui-box-dom"
+        )));
+        assert!(carries_own_transport(&words(
+            "/usr/bin/ssh ui-box-backend ui-box-dom"
         )));
     }
 
@@ -199,7 +201,7 @@ mod tests {
 
     #[test]
     fn an_ssh_backend_spawns_the_driver_on_the_lab_not_here() {
-        let mut config = config_for("ssh://fredrir@dlab-ui");
+        let mut config = config_for("ssh://fredrir@ui-box-backend");
         config.driver_dom = Some("/nix/store/abc-ui-box-dom/bin/ui-box-dom".to_string());
         let spec = resolve(Surface::Web, &config).expect("spec");
         assert!(
@@ -208,7 +210,7 @@ mod tests {
         );
         assert_eq!(spec.argv[0], "ssh");
         assert!(
-            spec.argv.contains(&"fredrir@dlab-ui".to_string()),
+            spec.argv.contains(&"fredrir@ui-box-backend".to_string()),
             "{:?}",
             spec.argv
         );
@@ -217,11 +219,11 @@ mod tests {
 
     #[test]
     fn an_explicit_ssh_command_is_spawned_verbatim() {
-        let mut config = config_for("ssh://fredrir@dlab-ui");
-        config.driver_dom = Some("ssh dlab-ui ui-box-dom".to_string());
+        let mut config = config_for("ssh://fredrir@ui-box-backend");
+        config.driver_dom = Some("ssh ui-box-backend ui-box-dom".to_string());
         let spec = resolve(Surface::Web, &config).expect("spec");
         assert!(spec.remote);
-        assert_eq!(spec.argv, vec!["ssh", "dlab-ui", "ui-box-dom"]);
+        assert_eq!(spec.argv, vec!["ssh", "ui-box-backend", "ui-box-dom"]);
     }
 
     #[test]
@@ -237,23 +239,23 @@ mod tests {
     fn a_remote_driver_is_labelled_with_its_host() {
         let mut config = crate::config::Config::resolve_from(
             &crate::config::Overrides {
-                backend: Some("ssh://fredrir@dlab-ui".to_string()),
+                backend: Some("ssh://fredrir@ui-box-backend".to_string()),
                 ..Default::default()
             },
             std::path::Path::new("/"),
         )
         .unwrap();
-        assert_eq!(driver_label(&config), "dom@dlab-ui");
+        assert_eq!(driver_label(&config), "dom@ui-box-backend");
         config.backend = crate::config::BackendSpec::Local;
         assert_eq!(driver_label(&config), "dom");
     }
 
     #[test]
     fn the_remote_driver_runs_where_the_display_is() {
-        let argv = remote_argv("fredrir@dlab-ui", &words(DOM_DRIVER_REMOTE), &[]);
+        let argv = remote_argv("fredrir@ui-box-backend", &words(DOM_DRIVER_REMOTE), &[]);
         assert_eq!(argv[0], "ssh");
         assert_eq!(argv[1], "-T");
-        assert_eq!(argv[argv.len() - 2], "fredrir@dlab-ui");
+        assert_eq!(argv[argv.len() - 2], "fredrir@ui-box-backend");
         assert_eq!(argv[argv.len() - 1], DOM_DRIVER_REMOTE);
         assert!(argv.contains(&"BatchMode=yes".to_string()));
         for absent in [
@@ -272,7 +274,11 @@ mod tests {
     #[test]
     fn a_declared_forward_rides_the_drivers_own_connection() {
         let forwards = crate::config::parse_forwards("3000:5173").expect("forwards");
-        let argv = remote_argv("fredrir@dlab-ui", &words(DOM_DRIVER_REMOTE), &forwards);
+        let argv = remote_argv(
+            "fredrir@ui-box-backend",
+            &words(DOM_DRIVER_REMOTE),
+            &forwards,
+        );
         let flags = argv.join(" ");
         assert!(
             flags.contains("-R 127.0.0.1:3000:127.0.0.1:5173"),
@@ -281,7 +287,7 @@ mod tests {
         for option in forward::EXCLUSIVE_OPTIONS {
             assert!(argv.contains(&option.to_string()), "{flags}");
         }
-        assert_eq!(argv[argv.len() - 2], "fredrir@dlab-ui");
+        assert_eq!(argv[argv.len() - 2], "fredrir@ui-box-backend");
         assert_eq!(argv[argv.len() - 1], DOM_DRIVER_REMOTE);
     }
 

@@ -64,7 +64,7 @@ pub struct GlobalArgs {
     )]
     pub app_args: Vec<String>,
 
-    #[arg(long, global = true, help = "Set DLAB_FORCE=1 on the ssh backend")]
+    #[arg(long, global = true, help = "Set UIBOX_FORCE=1 on the ssh backend")]
     pub force: bool,
 
     #[arg(

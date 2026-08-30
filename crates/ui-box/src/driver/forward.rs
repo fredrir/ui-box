@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn a_target_that_is_not_loopback_is_not_forwarded() {
         for target in [
-            "http://dlab-ui:3000",
+            "http://ui-box-backend:3000",
             "http://10.0.0.4:3000",
             "exec:/nix/store/abc-app/bin/app",
             "tui:nsql",
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn a_loopback_target_without_a_forward_is_refused_by_port() {
-        let config = config_for("ssh://fredrir@dlab-ui", "");
+        let config = config_for("ssh://fredrir@ui-box-backend", "");
         let err = guard(
             &config,
             "http://localhost:3000",
@@ -400,14 +400,14 @@ mod tests {
     fn a_covering_forward_lets_a_loopback_target_through() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let port = listener.local_addr().expect("addr").port();
-        let config = config_for("ssh://fredrir@dlab-ui", &format!("3000:{port}"));
+        let config = config_for("ssh://fredrir@ui-box-backend", &format!("3000:{port}"));
         guard(&config, "http://localhost:3000", "ui-box open").expect("declared forward covers it");
     }
 
     #[test]
     fn a_forward_whose_local_end_is_closed_is_refused() {
         let port = PORT_NO_UNPRIVILEGED_PROCESS_CAN_BIND;
-        let config = config_for("ssh://fredrir@dlab-ui", &format!("3000:{port}"));
+        let config = config_for("ssh://fredrir@ui-box-backend", &format!("3000:{port}"));
         let err = guard(&config, "http://localhost:3000", "ui-box open")
             .expect_err("nothing is listening on the local end");
         let message = format!("{err:#}");
@@ -461,8 +461,8 @@ mod tests {
 
     #[test]
     fn a_verbatim_ssh_driver_cannot_carry_a_forward() {
-        let mut config = config_for("ssh://fredrir@dlab-ui", "3000");
-        config.driver_dom = Some("ssh dlab-ui ui-box-dom".to_string());
+        let mut config = config_for("ssh://fredrir@ui-box-backend", "3000");
+        config.driver_dom = Some("ssh ui-box-backend ui-box-dom".to_string());
         let err = guard(&config, "http://localhost:3000", "ui-box open")
             .expect_err("dropping the forward silently is the bug this removes");
         assert_eq!(crate::error::kind_of(&err), "forward_unsupported");
@@ -484,22 +484,22 @@ mod tests {
 
     #[test]
     fn a_refused_remote_bind_is_not_reported_as_a_broken_ui() {
-        let config = config_for("ssh://fredrir@dlab-ui", "3000");
+        let config = config_for("ssh://fredrir@ui-box-backend", "3000");
         let raw = anyhow::anyhow!(
-            "driver dom@dlab-ui exited before answering info\n\
+            "driver dom@ui-box-backend exited before answering info\n\
              Warning: remote port forwarding failed for listen port 3000"
         );
         let classified = classify(raw, &config);
         assert_eq!(crate::error::kind_of(&classified), "forward_refused");
         let message = format!("{classified:#}");
         assert!(message.contains("3000"), "{message}");
-        assert!(message.contains("dlab-ui"), "{message}");
+        assert!(message.contains("ui-box-backend"), "{message}");
     }
 
     fn live_session_holding(dir: &std::path::Path, port: u16) -> (Config, String) {
         let config = crate::config::Config::resolve_from(
             &crate::config::Overrides {
-                backend: Some("ssh://fredrir@dlab-ui".to_string()),
+                backend: Some("ssh://fredrir@ui-box-backend".to_string()),
                 forward: vec![port.to_string()],
                 artifacts: Some(dir.to_path_buf()),
                 ..Default::default()
@@ -512,9 +512,9 @@ mod tests {
         let record = crate::session::SessionRecord {
             id: id.clone(),
             driver_session: "d1".to_string(),
-            driver_name: "dom@dlab-ui".to_string(),
+            driver_name: "dom@ui-box-backend".to_string(),
             driver_argv: super::super::remote_argv(
-                "fredrir@dlab-ui",
+                "fredrir@ui-box-backend",
                 &["ui-box-dom".to_string()],
                 &config.forward,
             ),
@@ -543,7 +543,7 @@ mod tests {
         let (config, id) = live_session_holding(&dir, 3000);
 
         let raw = anyhow::anyhow!(
-            "driver dom@dlab-ui exited before answering info\n\
+            "driver dom@ui-box-backend exited before answering info\n\
              Warning: remote port forwarding failed for listen port 3000"
         );
         let classified = classify(raw, &config);
@@ -562,7 +562,7 @@ mod tests {
         let (config, _) = live_session_holding(&dir, 4000);
 
         let raw = anyhow::anyhow!(
-            "driver dom@dlab-ui exited before answering info\n\
+            "driver dom@ui-box-backend exited before answering info\n\
              Warning: remote port forwarding failed for listen port 4000"
         );
         std::fs::remove_dir_all(config.sessions_dir()).ok();
@@ -574,8 +574,8 @@ mod tests {
 
     #[test]
     fn an_unrelated_driver_failure_stays_what_it_was() {
-        let config = config_for("ssh://fredrir@dlab-ui", "3000");
-        let raw = anyhow::anyhow!("driver dom@dlab-ui exited before answering info");
+        let config = config_for("ssh://fredrir@ui-box-backend", "3000");
+        let raw = anyhow::anyhow!("driver dom@ui-box-backend exited before answering info");
         assert_eq!(crate::error::kind_of(&classify(raw, &config)), "error");
     }
 }

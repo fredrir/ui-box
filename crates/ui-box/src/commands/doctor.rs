@@ -196,8 +196,8 @@ fn check_backend(config: &Config) -> (Check, Option<Box<dyn Backend>>) {
     }
     let hop = match (config.force, config.backend.host()) {
         (true, Some(host)) => proxy_hop(host)
-            .map(|hop| format!(", --force would set DLAB_FORCE=1 on {hop}"))
-            .unwrap_or_else(|| ", --force would set DLAB_FORCE=1 locally".to_string()),
+            .map(|hop| format!(", --force would set UIBOX_FORCE=1 on {hop}"))
+            .unwrap_or_else(|| ", --force would set UIBOX_FORCE=1 locally".to_string()),
         _ => String::new(),
     };
     match backend.require(&Cmd::new("echo").arg("ui-box")) {
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn a_loopback_target_on_a_lab_names_the_forward_that_would_reach_it() {
         let mut config = config_for(None);
-        config.backend = crate::config::BackendSpec::parse("ssh://fredrir@dlab-ui").unwrap();
+        config.backend = crate::config::BackendSpec::parse("ssh://fredrir@ui-box-backend").unwrap();
         let detail = refused(&config, "http://localhost:3000", "localhost", 3000);
         assert!(detail.contains("the lab's own loopback"), "{detail}");
         assert!(detail.contains("--forward 3000"), "{detail}");
@@ -829,14 +829,14 @@ mod tests {
     #[test]
     fn a_routable_target_is_not_blamed_on_a_missing_forward() {
         let mut config = config_for(None);
-        config.backend = crate::config::BackendSpec::parse("ssh://fredrir@dlab-ui").unwrap();
+        config.backend = crate::config::BackendSpec::parse("ssh://fredrir@ui-box-backend").unwrap();
         let detail = refused(&config, "http://example.test:80", "example.test", 80);
         assert!(!detail.contains("--forward"), "{detail}");
     }
 
     fn lab_config(forwards: Vec<crate::config::Forward>) -> Config {
         let mut config = config_for(None);
-        config.backend = crate::config::BackendSpec::parse("ssh://fredrir@dlab-ui").unwrap();
+        config.backend = crate::config::BackendSpec::parse("ssh://fredrir@ui-box-backend").unwrap();
         config.forward = forwards;
         config
     }
@@ -911,7 +911,7 @@ mod tests {
         assert!(is_loopback("127.0.0.1"));
         assert!(is_loopback("127.1.2.3"));
         assert!(is_loopback("::1"));
-        assert!(!is_loopback("dlab-ui"));
+        assert!(!is_loopback("ui-box-backend"));
         assert!(!is_loopback("10.0.0.1"));
     }
 }

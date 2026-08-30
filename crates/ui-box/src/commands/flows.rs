@@ -488,7 +488,7 @@ mod tests {
     fn provenance_lands_in_the_right_meta_fields() {
         let mut meta = Meta::new(
             "20260828T000000Z-abcdef01",
-            "ssh://fredrir@dlab-ui",
+            "ssh://fredrir@ui-box-backend",
             Surface::Web,
         );
         apply_placement(&mut meta, &placed());
@@ -533,8 +533,8 @@ mod tests {
     fn a_url_target_survives_placement_untouched() {
         let placement = placed();
         assert_eq!(
-            effective_target("http://dlab-ui:3000".to_string(), Some(&placement)),
-            "http://dlab-ui:3000"
+            effective_target("http://ui-box-backend:3000".to_string(), Some(&placement)),
+            "http://ui-box-backend:3000"
         );
     }
 
