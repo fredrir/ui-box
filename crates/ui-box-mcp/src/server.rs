@@ -425,7 +425,9 @@ impl UiBoxServer {
             args.session
         ));
         report.absorb(&invocation);
-        if args.snapshot_on_failure == Some(false) || !invocation.landing.is_step_failure() {
+        let nothing = proved_nothing(&invocation);
+        let worth_capturing = invocation.landing.is_step_failure() || nothing;
+        if args.snapshot_on_failure == Some(false) || !worth_capturing {
             return report.build();
         }
 
@@ -433,13 +435,18 @@ impl UiBoxServer {
             .capture(CaptureRequest {
                 session: &args.session,
                 mode: "both",
-                name: Some("failed"),
+                name: Some(if nothing { "proved-nothing" } else { "failed" }),
                 max_chars: args.max_chars.unwrap_or(DEFAULT_MAX_CHARS),
                 want_image: true,
                 cwd,
             })
             .await;
-        merge_capture(&mut report, &capture, "state when the step failed");
+        let label = if nothing {
+            "the page the assertion looked at, which is the evidence that it proved nothing"
+        } else {
+            "state when the step failed"
+        };
+        merge_capture(&mut report, &capture, label);
         report.build()
     }
 
@@ -1139,7 +1146,13 @@ fn merge_events(report: &mut Report, events: &Events) {
         report.block(&title, body);
     }
     if !events.console.is_empty() || !events.network.is_empty() {
-        report.fact("console_errors", events.console.len());
+        report.fact(
+            "console_errors",
+            events.console.len().saturating_sub(events.console_benign),
+        );
+        if events.console_benign > 0 {
+            report.fact("console_benign", events.console_benign);
+        }
         report.fact("network_failures", events.network.len());
     }
 }

@@ -203,10 +203,14 @@ pub fn snap(config: &Config, args: &SnapArgs) -> Result<Summary> {
         artifacts.name,
         executor.run.snaps_dir().display()
     );
+    let mut snap = snap_json(&artifacts);
+    if let (Some(map), Some(text)) = (snap.as_object_mut(), &artifacts.text) {
+        map.insert("text_inline".to_string(), json!(text));
+    }
     Ok(Summary::ok(json!({
         "session": record.id,
         "run": record.id,
-        "snap": snap_json(&artifacts),
+        "snap": snap,
         "steps_total": executor.total,
         "expires_in": record.expires_in(),
     })))
@@ -280,15 +284,36 @@ pub fn eval(config: &Config, args: &EvalArgs) -> Result<Summary> {
     let mut record = store.load(&args.session)?;
     record.ensure_usable()?;
     let mut conn = record.connect(config.rpc_timeout)?;
-    let value = conn.eval(&record.driver_session, &args.expr)?;
+    let outcome = conn.eval_result(&record.driver_session, &args.expr)?;
     record.touch();
     store.save(&record)?;
-    Ok(Summary::ok(json!({
+
+    let carried_nothing = outcome.carried_nothing();
+    let body = json!({
         "session": record.id,
         "eval": args.expr,
-        "value": value,
+        "status": if carried_nothing { NOTHING_VERDICT } else { "passed" },
+        "value": outcome.value,
+        "value_kind": outcome.kind,
+        "serializable": outcome.serializable,
+        "detail": outcome.detail,
         "expires_in": record.expires_in(),
-    })))
+    });
+    if !carried_nothing {
+        return Ok(Summary::ok(body));
+    }
+    note!(
+        "{} evaluated to {}, which the driver could not carry over the wire",
+        args.expr,
+        outcome.kind.as_deref().unwrap_or("a value")
+    );
+    note!("the null below is the absence of an answer, not the answer");
+    note!(
+        "wrap it in something serialisable to see it, e.g. `ui-box eval {} 'JSON.stringify({})'`",
+        record.id,
+        args.expr
+    );
+    Ok(Summary::nothing(body))
 }
 
 pub fn wake(config: &Config, args: &WakeArgs) -> Result<Summary> {

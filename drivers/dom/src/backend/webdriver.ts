@@ -18,7 +18,13 @@ import type { ParsedSelector } from "../selector.js";
 import type { DrainedEvents, OpenOptions, Surface, Viewport } from "../types.js";
 import { WebDriverClient } from "../webdriver/client.js";
 import { keyActions, parseChord } from "../webdriver/keys.js";
-import { type Backend, type FillOptions, callExpression, toRuntimeSpec } from "./index.js";
+import {
+  type Backend,
+  type FillOptions,
+  callExpression,
+  describeExpression,
+  toRuntimeSpec,
+} from "./index.js";
 
 const RUNTIME_SOURCE = uiboxRuntime.toString();
 const DRIVER_BOOT_TIMEOUT_MS = 20_000;
@@ -205,10 +211,9 @@ export class WebDriverBackend implements Backend {
 
   async evalDescribe(expr: string): Promise<EvalDescriptor> {
     await this.ensureRuntime();
-    return (await this.client.executeScript(
-      `return window.__uibox["describeValue"](${callExpression(expr)});`,
-      [],
-    )) as EvalDescriptor;
+    const script = `var done = arguments[arguments.length - 1];
+${describeExpression(expr)}.then(done, done);`;
+    return (await this.client.executeAsyncScript(script, [])) as EvalDescriptor;
   }
 
   async describeElement(selector: ParsedSelector): Promise<VisibilityReport> {

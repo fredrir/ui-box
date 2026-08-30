@@ -204,7 +204,11 @@ export class Session {
       throw new DriverError("params", "eval requires a non-empty expr string", RPC_INVALID_PARAMS);
     }
     this.assertReady();
-    return this.backend.evalDescribe(expr);
+    const described = await this.backend.evalDescribe(expr);
+    if (described.threw) {
+      throw new DriverError("eval", `eval threw: ${described.detail ?? "unknown error"}`);
+    }
+    return described;
   }
 
   async close(): Promise<void> {
@@ -344,6 +348,8 @@ export class Session {
       rect: report.rect,
       hitTest: report.hitTest,
       styles: report.styles,
+      ...(report.answeredBy ? { answeredBy: report.answeredBy } : {}),
+      ...(report.retargetedFrom ? { retargetedFrom: report.retargetedFrom } : {}),
       ...(pixel ? { pixel } : {}),
     };
     if (report.visible) return evidence;
@@ -417,7 +423,16 @@ export class Session {
     );
     return [
       upscalePng(cropped, upscale),
-      { selector: raw, rect: { ...rect }, padding, scale, upscale, pixel },
+      {
+        selector: raw,
+        rect: { ...rect },
+        padding,
+        scale,
+        upscale,
+        pixel,
+        ...(report.answeredBy ? { answeredBy: report.answeredBy } : {}),
+        ...(report.retargetedFrom ? { retargetedFrom: report.retargetedFrom } : {}),
+      },
     ];
   }
 

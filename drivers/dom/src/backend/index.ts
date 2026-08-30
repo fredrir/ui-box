@@ -41,8 +41,35 @@ export interface Backend {
 
 export function callExpression(expr: string): string {
   const trimmed = expr.trim();
-  const isFunction = /^(async\s+)?(function\b|\(|[A-Za-z_$][\w$]*\s*=>)/.test(trimmed);
-  return isFunction ? `(${trimmed})()` : `(${trimmed})`;
+  return isCallableSource(trimmed) ? `(${trimmed})()` : `(${trimmed})`;
+}
+
+function isCallableSource(source: string): boolean {
+  const body = /^async\s/.test(source) ? source.replace(/^async\s+/, "") : source;
+  if (/^function\b/.test(body)) return true;
+  if (/^[A-Za-z_$][\w$]*\s*=>/.test(body)) return true;
+  if (!body.startsWith("(")) return false;
+  const close = matchingParen(body);
+  return close !== -1 && /^\s*=>/.test(body.slice(close + 1));
+}
+
+function matchingParen(source: string): number {
+  let depth = 0;
+  for (let i = 0; i < source.length; i += 1) {
+    if (source[i] === "(") depth += 1;
+    else if (source[i] === ")") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+const EVAL_ERROR_DESCRIPTOR =
+  'function (err) { return { kind: "error", serializable: false, json: null, threw: true, detail: String((err && err.message) || err).slice(0, 400) }; }';
+
+export function describeExpression(expr: string): string {
+  return `Promise.resolve().then(function () { return ${callExpression(expr)}; }).then(function (value) { return window.__uibox.describeValue(value); }, ${EVAL_ERROR_DESCRIPTOR})`;
 }
 
 export function toRuntimeSpec(selector: ParsedSelector): RuntimeSelectorSpec {

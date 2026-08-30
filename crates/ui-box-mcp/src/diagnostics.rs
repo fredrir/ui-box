@@ -19,6 +19,7 @@ pub struct Cursor {
 pub struct Events {
     pub console: Vec<String>,
     pub network: Vec<String>,
+    pub console_benign: usize,
     pub console_dropped: usize,
     pub network_dropped: usize,
     pub cursor: Cursor,
@@ -69,17 +70,22 @@ pub async fn events_since(run_dir: &Path, from: Cursor) -> Events {
         .get(from.network.min(network_lines.len())..)
         .unwrap_or(&[]);
 
-    let mut console: Vec<String> = fresh_console.iter().filter_map(console_error).collect();
+    let mut console_entries: Vec<(String, bool)> =
+        fresh_console.iter().filter_map(console_error).collect();
     let mut network: Vec<String> = fresh_network.iter().filter_map(network_failure).collect();
 
-    let console_dropped = console.len().saturating_sub(MAX_EVENTS);
+    let console_dropped = console_entries.len().saturating_sub(MAX_EVENTS);
     let network_dropped = network.len().saturating_sub(MAX_EVENTS);
-    console.truncate(MAX_EVENTS);
+    console_entries.truncate(MAX_EVENTS);
     network.truncate(MAX_EVENTS);
+
+    let console_benign = console_entries.iter().filter(|(_, benign)| *benign).count();
+    let console: Vec<String> = console_entries.into_iter().map(|(line, _)| line).collect();
 
     Events {
         console,
         network,
+        console_benign,
         console_dropped,
         network_dropped,
         cursor,
@@ -97,16 +103,21 @@ async fn read_lines(path: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn console_error(entry: &Value) -> Option<String> {
+fn console_error(entry: &Value) -> Option<(String, bool)> {
     let kind = entry.get("type").and_then(Value::as_str).unwrap_or("log");
     if kind != "error" && kind != "pageerror" {
         return None;
     }
     let text = entry.get("text").and_then(Value::as_str).unwrap_or("");
-    match entry.get("location").and_then(Value::as_str) {
-        Some(location) if !location.is_empty() => Some(format!("[{kind}] {text} ({location})")),
-        _ => Some(format!("[{kind}] {text}")),
-    }
+    let benign = entry.get("benign").and_then(Value::as_bool) == Some(true);
+    let mark = if benign { "[benign] " } else { "" };
+    let line = match entry.get("location").and_then(Value::as_str) {
+        Some(location) if !location.is_empty() => {
+            format!("{mark}[{kind}] {text} ({location})")
+        }
+        _ => format!("{mark}[{kind}] {text}"),
+    };
+    Some((line, benign))
 }
 
 fn network_failure(entry: &Value) -> Option<String> {
@@ -163,4 +174,39 @@ pub fn last_text(snaps: &Value) -> Option<PathBuf> {
         .iter()
         .rev()
         .find_map(|snap| snap.get("text").and_then(Value::as_str).map(PathBuf::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(raw: &str) -> Value {
+        serde_json::from_str(raw).expect("entry")
+    }
+
+    #[test]
+    fn a_benign_entry_is_still_rendered_and_marked() {
+        let (line, benign) =
+            console_error(&entry(r#"{"type":"error","text":"noise","benign":true}"#))
+                .expect("line");
+        assert!(benign);
+        assert!(
+            line.contains("noise"),
+            "dropping it would hide a change in its text or frequency: {line}"
+        );
+        assert!(line.starts_with("[benign]"), "{line}");
+    }
+
+    #[test]
+    fn a_real_error_is_not_marked_benign() {
+        let (line, benign) =
+            console_error(&entry(r#"{"type":"error","text":"boom"}"#)).expect("line");
+        assert!(!benign);
+        assert_eq!(line, "[error] boom");
+    }
+
+    #[test]
+    fn a_log_line_is_not_a_console_error_at_all() {
+        assert!(console_error(&entry(r#"{"type":"log","text":"hello"}"#)).is_none());
+    }
 }

@@ -13,10 +13,12 @@ use crate::run::{RunDir, CONSOLE, NETWORK};
 pub struct SnapArtifacts {
     pub name: String,
     pub mode: String,
+    pub text: Option<String>,
     pub text_path: Option<PathBuf>,
     pub png_path: Option<PathBuf>,
     pub text_bytes: usize,
     pub console: usize,
+    pub console_benign: usize,
     pub network: usize,
 }
 
@@ -196,13 +198,19 @@ impl Executor {
         }
         let text_path = self.localise(snap.txt_path.as_ref())?;
         let png_path = self.localise(snap.png_path.as_ref())?;
+        let benign = snap.console.iter().filter(|entry| is_benign(entry)).count();
         let artifacts = SnapArtifacts {
             name: written.clone(),
             mode: mode.to_string(),
+            text: mode
+                .wants_text()
+                .then(|| snap_text(snap.text.as_deref(), text_path.as_deref()))
+                .flatten(),
             text_bytes: text_bytes(snap.text.as_deref(), text_path.as_deref()),
             text_path,
             png_path,
-            console: snap.console.len(),
+            console: snap.console.len() - benign,
+            console_benign: benign,
             network: snap.network.len(),
         };
         if mode.wants_text() && artifacts.text_path.is_none() {
@@ -223,6 +231,17 @@ impl Executor {
     }
 }
 
+pub fn is_benign(entry: &serde_json::Value) -> bool {
+    entry.get("benign").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+pub fn snap_text(inline: Option<&str>, written: Option<&Path>) -> Option<String> {
+    if let Some(text) = inline {
+        return Some(text.to_string());
+    }
+    std::fs::read_to_string(written?).ok()
+}
+
 pub fn text_bytes(inline: Option<&str>, written: Option<&Path>) -> usize {
     if let Some(text) = inline {
         return text.len();
@@ -241,6 +260,7 @@ pub fn snap_json(artifacts: &SnapArtifacts) -> serde_json::Value {
         "png": artifacts.png_path.as_ref().map(|p| p.display().to_string()),
         "text_bytes": artifacts.text_bytes,
         "console": artifacts.console,
+        "console_benign": artifacts.console_benign,
         "network": artifacts.network,
     })
 }
@@ -282,6 +302,33 @@ mod tests {
         let pass = outcome(true, None);
         assert!(!pass.failed());
         assert!(!pass.verified_nothing());
+    }
+
+    #[test]
+    fn a_console_entry_the_driver_called_benign_is_not_an_error() {
+        assert!(is_benign(
+            &serde_json::json!({ "text": "x", "benign": true })
+        ));
+        assert!(!is_benign(&serde_json::json!({ "text": "x" })));
+        assert!(!is_benign(
+            &serde_json::json!({ "text": "x", "benign": false })
+        ));
+    }
+
+    #[test]
+    fn snapshot_text_prefers_what_came_over_the_wire() {
+        let path = std::env::temp_dir().join("uibox-snap-text-probe.txt");
+        std::fs::write(&path, "from the file\n").unwrap();
+        assert_eq!(
+            snap_text(Some("from the wire"), Some(&path)).as_deref(),
+            Some("from the wire")
+        );
+        assert_eq!(
+            snap_text(None, Some(&path)).as_deref(),
+            Some("from the file\n")
+        );
+        assert_eq!(snap_text(None, None), None);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -103,6 +103,8 @@ export interface ClipReport {
   scale: number;
   upscale: number;
   pixel?: string;
+  answeredBy?: string;
+  retargetedFrom?: string;
 }
 
 export interface AssertTextStepBody {

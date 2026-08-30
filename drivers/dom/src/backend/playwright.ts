@@ -26,7 +26,7 @@ import { uiboxRuntime } from "../injected/runtime.js";
 import { EventRecorder, nowIso } from "../recorder.js";
 import type { ParsedSelector, TextMatch } from "../selector.js";
 import type { DrainedEvents, OpenOptions, Surface, Viewport } from "../types.js";
-import { type Backend, type FillOptions, callExpression, toRuntimeSpec } from "./index.js";
+import { type Backend, type FillOptions, describeExpression, toRuntimeSpec } from "./index.js";
 
 const BROWSERS = { chromium, firefox, webkit };
 
@@ -190,9 +190,7 @@ export class PlaywrightBackend implements Backend {
 
   async evalDescribe(expr: string): Promise<EvalDescriptor> {
     await this.ensureRuntime();
-    return this.page.evaluate(
-      `window.__uibox.describeValue(${callExpression(expr)})`,
-    ) as Promise<EvalDescriptor>;
+    return this.page.evaluate(describeExpression(expr)) as Promise<EvalDescriptor>;
   }
 
   async describeElement(selector: ParsedSelector): Promise<VisibilityReport> {

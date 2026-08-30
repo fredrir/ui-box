@@ -479,6 +479,70 @@ describe("clip, visibility and eval over the driver protocol", { timeout: 60_000
     fake.visibility = { ...fake.visibility, matches: 1 };
   });
 
+  test("an async expression is awaited before it is described", async () => {
+    fake.evalDescriptor = {
+      kind: "number",
+      serializable: true,
+      json: "7",
+      threw: false,
+      detail: null,
+    };
+    const resolved = await client.call("driver.eval", {
+      sessionId,
+      expr: "(async () => 7)()",
+    });
+    assert.equal(resolved.value, 7);
+    assert.equal(resolved.kind, "number");
+
+    const asked = fake.scripts.filter((script) => script.includes("describeValue"));
+    const last = asked[asked.length - 1] ?? "";
+    assert.match(last, /return \(\(async \(\) => 7\)\(\)\);/);
+    assert.match(last, /arguments\[arguments\.length - 1\]/);
+  });
+
+  test("a throwing expression is an rpc error on both surfaces, never a null value", async () => {
+    fake.evalDescriptor = {
+      kind: "error",
+      serializable: false,
+      json: null,
+      threw: true,
+      detail: "boom is not defined",
+    };
+    await assert.rejects(
+      () => client.call("driver.eval", { sessionId, expr: "boom()" }),
+      (err: any) => {
+        assert.match(err.message, /eval threw: boom is not defined/);
+        return true;
+      },
+    );
+  });
+
+  test("a retargeted selector says which element answered", async () => {
+    fake.visibility = {
+      ...defaultVisibleReport(),
+      answeredBy: "label",
+      retargetedFrom: "input[type=checkbox]",
+    };
+    const result = await client.call("driver.act", {
+      sessionId,
+      step: { assert_visible: "role=checkbox[name=Cryptography]" },
+    });
+    assert.equal(result.ok, true, JSON.stringify(result.error));
+    assert.equal(result.report.answeredBy, "label");
+    assert.equal(result.report.retargetedFrom, "input[type=checkbox]");
+
+    const snap = await client.call("driver.snap", {
+      sessionId,
+      mode: "png",
+      name: "chip",
+      clip: "role=checkbox[name=Cryptography]",
+      clipPadding: 0,
+      clipMinSide: 1,
+    });
+    assert.equal(snap.clip.retargetedFrom, "input[type=checkbox]");
+    fake.visibility = defaultVisibleReport();
+  });
+
   test("assert_visible reports the rect, the hit test and the painted pixel", async () => {
     const result = await client.call("driver.act", {
       sessionId,
@@ -536,17 +600,6 @@ describe("clip, visibility and eval over the driver protocol", { timeout: 60_000
     assert.equal(absent.serializable, false);
 
     fake.evalDescriptor = {
-      kind: "promise",
-      serializable: false,
-      json: null,
-      threw: false,
-      detail: "the expression returned a promise and the driver evaluates synchronously",
-    };
-    const pending = await client.call("driver.eval", { sessionId, expr: "fetch('/x')" });
-    assert.equal(pending.kind, "promise");
-    assert.match(pending.detail, /synchronously/);
-
-    fake.evalDescriptor = {
       kind: "object",
       serializable: true,
       json: '{"a":[1,2]}',
@@ -566,6 +619,8 @@ function defaultVisibleReport(): any {
     devicePixelRatio: 1,
     visible: true,
     hitTest: "self",
+    answeredBy: "div",
+    retargetedFrom: null,
     reasons: [],
     styles: {
       display: "block",

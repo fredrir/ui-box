@@ -62,6 +62,8 @@ export interface VisibilityReport {
   devicePixelRatio: number;
   visible: boolean;
   hitTest: "self" | "descendant" | "other" | "outside" | "none";
+  answeredBy: string | null;
+  retargetedFrom: string | null;
   reasons: string[];
   styles: { display: string; visibility: string; opacity: string; backgroundColor: string };
 }
@@ -569,10 +571,17 @@ export function uiboxRuntime(config: RuntimeConfig): void {
     return "other";
   }
 
+  function tagOf(el: Element): string {
+    const tag = el.tagName.toLowerCase();
+    const id = el.id ? `#${el.id}` : "";
+    if (tag !== "input") return `${tag}${id}`;
+    const type = normalize(attr(el, "type")).toLowerCase();
+    return type ? `${tag}[type=${type}]${id}` : `${tag}${id}`;
+  }
+
   function describeElement(spec: RuntimeSelectorSpec): VisibilityReport {
-    const matches = retarget(
-      resolve({ ...spec, options: { ...spec.options, includeHidden: true } }),
-    );
+    const raw = resolve({ ...spec, options: { ...spec.options, includeHidden: true } });
+    const matches = retarget(raw);
     const viewport = { width: window.innerWidth, height: window.innerHeight };
     const report: VisibilityReport = {
       matches: matches.length,
@@ -581,6 +590,8 @@ export function uiboxRuntime(config: RuntimeConfig): void {
       devicePixelRatio: window.devicePixelRatio || 1,
       visible: false,
       hitTest: "none",
+      answeredBy: null,
+      retargetedFrom: null,
       reasons: [],
       styles: { display: "", visibility: "", opacity: "", backgroundColor: "" },
     };
@@ -590,6 +601,10 @@ export function uiboxRuntime(config: RuntimeConfig): void {
       return report;
     }
     if (matches.length > 1) report.reasons.push(`${matches.length} elements matched`);
+
+    report.answeredBy = tagOf(el);
+    const original = raw[0];
+    if (original && original !== el) report.retargetedFrom = tagOf(original);
 
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
@@ -637,15 +652,6 @@ export function uiboxRuntime(config: RuntimeConfig): void {
         json: null,
         threw: false,
         detail: String(value).slice(0, 200),
-      };
-    }
-    if (kind === "object" && typeof (value as { then?: unknown }).then === "function") {
-      return {
-        kind: "promise",
-        serializable: false,
-        json: null,
-        threw: false,
-        detail: "the expression returned a promise and the driver evaluates synchronously",
       };
     }
     try {

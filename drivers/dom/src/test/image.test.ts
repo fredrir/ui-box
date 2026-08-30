@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PNG } from "pngjs";
+import { callExpression, describeExpression } from "../backend/index.js";
 import {
   MAX_UPSCALED_SIDE,
   cropPng,
@@ -87,4 +88,30 @@ test("upscaleFactor never produces a side beyond the output cap", () => {
   assert.equal(upscaleFactor(2, 64, 96), Math.floor(MAX_UPSCALED_SIDE / 64));
   assert.ok(64 * upscaleFactor(2, 64, 96) <= MAX_UPSCALED_SIDE);
   assert.equal(upscaleFactor(4, 1900, 96), 1);
+});
+
+test("callExpression calls a function source and only parenthesises anything else", () => {
+  assert.equal(callExpression("() => 7"), "(() => 7)()");
+  assert.equal(callExpression("(a, b) => a + b"), "((a, b) => a + b)()");
+  assert.equal(callExpression("value => value"), "(value => value)()");
+  assert.equal(callExpression("function () { return 7; }"), "(function () { return 7; })()");
+  assert.equal(callExpression("async () => 7"), "(async () => 7)()");
+});
+
+test("callExpression does not re-invoke an expression that already called itself", () => {
+  assert.equal(callExpression("(async () => 7)()"), "((async () => 7)())");
+  assert.equal(callExpression("(function () { return 7; })()"), "((function () { return 7; })())");
+  assert.equal(callExpression("(a + b)"), "((a + b))");
+  assert.equal(callExpression("(1 + 2) * 3"), "((1 + 2) * 3)");
+  assert.equal(callExpression("document.title"), "(document.title)");
+});
+
+test("describeExpression defers evaluation, awaits, then describes", () => {
+  const script = describeExpression("fetch('/x')");
+  assert.match(
+    script,
+    /^Promise\.resolve\(\)\.then\(function \(\) \{ return \(fetch\('\/x'\)\); \}\)/,
+  );
+  assert.match(script, /window\.__uibox\.describeValue\(value\)/);
+  assert.match(script, /threw: true/);
 });

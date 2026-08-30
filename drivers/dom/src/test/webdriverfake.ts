@@ -62,6 +62,8 @@ function defaultVisibility(): any {
     devicePixelRatio: 1,
     visible: true,
     hitTest: "self",
+    answeredBy: "div",
+    retargetedFrom: null,
     reasons: [],
     styles: {
       display: "block",
@@ -112,6 +114,12 @@ export async function startFakeWebDriver(): Promise<FakeWebDriver> {
         return reply({ [PROTOCOL_ELEMENT_KEY]: "e1" });
       }
       if (/^\/element\/e1\/(click|clear|value)$/.test(rest)) return reply(null);
+      if (rest === "/execute/async") {
+        const script = String(body?.script ?? "");
+        scripts.push(script);
+        if (script.includes("describeValue")) return reply(state.evalDescriptor);
+        return reply(null);
+      }
       if (rest === "/execute/sync") {
         const script = String(body?.script ?? "");
         scripts.push(script);

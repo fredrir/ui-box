@@ -50,6 +50,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     } else {
       result = { ok: true };
     }
+  } else if (verb === 'eval') {
+    const e = req.params.expr;
+    if (e === 'gone') result = { value: null, kind: 'undefined', serializable: false };
+    else if (e === 'nul') result = { value: null, kind: 'null', serializable: true };
+    else result = { value: { a: 1 }, kind: 'object', serializable: true };
   } else if (verb === 'snap') {
     const dir = dirs.get(req.params.sessionId);
     fs.mkdirSync(dir, { recursive: true });
@@ -58,7 +63,14 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     let name = base, k = 1;
     while (seen.has(name)) { k += 1; name = base + '-' + k; }
     seen.add(name); used.set(req.params.sessionId, seen);
-    const out = { name, console: [], network: [] };
+    const out = {
+      name,
+      console: [
+        { type: 'error', text: 'real boom' },
+        { type: 'error', text: 'noisy extension warning', benign: true },
+      ],
+      network: [],
+    };
     if (req.params.mode !== 'png') {
       const p = path.join(dir, name + '.txt');
       const tree = '- heading "Costs" [level=1]:\n  - text: all \u00b7 11\n';
@@ -524,6 +536,98 @@ fn a_live_step_that_proved_nothing_says_so_without_blaming_the_page() {
     ));
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["error_kind"], "assertion");
+
+    ui_box(&dir, &["close", &session]);
+}
+
+#[test]
+fn a_value_the_driver_could_not_carry_is_not_reported_as_null() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("eval-uncarried");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+
+    let output = ui_box(&dir, &["eval", &session, "gone"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the expression ran, nothing failed"
+    );
+    let body = summary(&output);
+    assert_eq!(
+        body["ok"], false,
+        "printing value:null with ok:true is the answer-shaped absence being fixed"
+    );
+    assert_eq!(body["status"], "nothing_verified");
+    assert_eq!(body["serializable"], false);
+    assert_eq!(body["value_kind"], "undefined");
+
+    let genuine = summary(&ui_box(&dir, &["eval", &session, "nul"]));
+    assert_eq!(
+        genuine["ok"], true,
+        "a real null is a real answer: {genuine}"
+    );
+    assert_eq!(genuine["serializable"], true);
+    assert!(genuine["value"].is_null());
+
+    let object = summary(&ui_box(&dir, &["eval", &session, "obj"]));
+    assert_eq!(object["ok"], true);
+    assert_eq!(object["value"]["a"], 1);
+
+    ui_box(&dir, &["close", &session]);
+}
+
+#[test]
+fn a_benign_console_entry_is_not_counted_but_is_still_recorded() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("console-benign");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+    let run_dir = PathBuf::from(opened["run_dir"].as_str().expect("run_dir"));
+
+    let snapped = summary(&ui_box(&dir, &["snap", &session, "--name", "shot"]));
+    assert_eq!(
+        snapped["snap"]["console"], 1,
+        "a benign entry must not inflate the error count: {}",
+        snapped["snap"]
+    );
+    assert_eq!(snapped["snap"]["console_benign"], 1);
+
+    let recorded = std::fs::read_to_string(run_dir.join("console.jsonl")).expect("console.jsonl");
+    assert!(recorded.contains("real boom"), "{recorded}");
+    assert!(
+        recorded.contains("noisy extension warning"),
+        "dropping benign entries hides a change in their text or frequency: {recorded}"
+    );
+
+    ui_box(&dir, &["close", &session]);
+}
+
+#[test]
+fn a_text_snapshot_carries_its_text_without_a_second_round_trip() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("snap-inline");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+
+    let snapped = summary(&ui_box(&dir, &["snap", &session, "--name", "shot"]));
+    let inline = snapped["snap"]["text_inline"]
+        .as_str()
+        .expect("the driver already returned this text, so the caller should not have to read it");
+    assert!(inline.contains("Costs"), "{inline}");
+
+    let path = snapped["snap"]["text"].as_str().expect("text path");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("snapshot file"),
+        inline,
+        "the inline text must be the same bytes the file holds"
+    );
 
     ui_box(&dir, &["close", &session]);
 }

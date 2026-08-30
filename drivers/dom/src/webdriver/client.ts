@@ -109,6 +109,10 @@ export class WebDriverClient {
     return this.send("POST", "/execute/sync", { script, args }, true);
   }
 
+  async executeAsyncScript(script: string, args: unknown[] = []): Promise<unknown> {
+    return this.send("POST", "/execute/async", { script, args }, true);
+  }
+
   async takeScreenshot(): Promise<Buffer> {
     const base64 = (await this.send("GET", "/screenshot", undefined, true)) as string;
     return Buffer.from(base64, "base64");
