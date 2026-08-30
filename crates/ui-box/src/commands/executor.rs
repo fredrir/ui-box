@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::backend::Backend;
-use crate::driver::client::NOTHING_VERIFIED;
+use crate::driver::client::{SnapClip, NOTHING_VERIFIED};
 use crate::driver::Connection;
 use crate::flow::{SnapMode, SnapStep, Step};
 use crate::note;
@@ -17,6 +17,7 @@ pub struct SnapArtifacts {
     pub text_path: Option<PathBuf>,
     pub png_path: Option<PathBuf>,
     pub text_bytes: usize,
+    pub clip: Option<serde_json::Value>,
     pub console: usize,
     pub console_benign: usize,
     pub network: usize,
@@ -122,6 +123,9 @@ impl Executor {
                     recorded = Step::Snap(SnapStep::Detail {
                         name: Some(artifacts.name.clone()),
                         mode: snap.mode(),
+                        clip: snap.clip().map(str::to_string),
+                        clip_padding: snap.clip_padding(),
+                        clip_min_side: snap.clip_min_side(),
                     });
                 }
             }
@@ -162,6 +166,9 @@ impl Executor {
                 Step::Snap(SnapStep::Detail {
                     name: Some(name),
                     mode: Some(mode),
+                    clip: snap.clip().map(str::to_string),
+                    clip_padding: snap.clip_padding(),
+                    clip_min_side: snap.clip_min_side(),
                 })
             }
             other => other.clone(),
@@ -172,7 +179,7 @@ impl Executor {
         if let Step::Snap(snap) = step {
             let name = snap.name().unwrap_or("snapshot").to_string();
             let mode = snap.mode().unwrap_or(self.default_mode);
-            let artifacts = self.snapshot(&name, mode)?;
+            let artifacts = self.snapshot(&name, mode, &clip_of(snap))?;
             return Ok(StepOutcome {
                 ok: true,
                 error: None,
@@ -190,8 +197,15 @@ impl Executor {
         })
     }
 
-    pub fn snapshot(&mut self, name: &str, mode: SnapMode) -> Result<SnapArtifacts> {
-        let snap = self.conn.snap(&self.driver_session, mode.as_str(), name)?;
+    pub fn snapshot(
+        &mut self,
+        name: &str,
+        mode: SnapMode,
+        clip: &SnapClip,
+    ) -> Result<SnapArtifacts> {
+        let snap = self
+            .conn
+            .snap(&self.driver_session, mode.as_str(), name, clip)?;
         let written = snap.name.clone().unwrap_or_else(|| name.to_string());
         if written != name {
             note!("driver stored snapshot {name} as {written}");
@@ -207,6 +221,7 @@ impl Executor {
                 .then(|| snap_text(snap.text.as_deref(), text_path.as_deref()))
                 .flatten(),
             text_bytes: text_bytes(snap.text.as_deref(), text_path.as_deref()),
+            clip: snap.clip.clone(),
             text_path,
             png_path,
             console: snap.console.len() - benign,
@@ -219,6 +234,9 @@ impl Executor {
         if mode.wants_png() && artifacts.png_path.is_none() {
             note!("driver wrote no png for snapshot {written}");
         }
+        if let Some(report) = &artifacts.clip {
+            note_clip(report);
+        }
         self.run.append_events(CONSOLE, &snap.console)?;
         self.run.append_events(NETWORK, &snap.network)?;
         Ok(artifacts)
@@ -228,6 +246,22 @@ impl Executor {
         if let Err(err) = self.conn.close(&self.driver_session) {
             note!("driver did not confirm close: {err}");
         }
+    }
+}
+
+pub fn clip_of(snap: &SnapStep) -> SnapClip {
+    SnapClip {
+        selector: snap.clip().map(str::to_string),
+        padding: snap.clip_padding(),
+        min_side: snap.clip_min_side(),
+    }
+}
+
+fn note_clip(report: &serde_json::Value) {
+    let answered = report.get("answeredBy").and_then(|v| v.as_str());
+    let retargeted = report.get("retargetedFrom").and_then(|v| v.as_str());
+    if let (Some(answered), Some(from)) = (answered, retargeted) {
+        note!("clip retargeted from {from} to {answered}");
     }
 }
 
@@ -259,6 +293,7 @@ pub fn snap_json(artifacts: &SnapArtifacts) -> serde_json::Value {
         "text": artifacts.text_path.as_ref().map(|p| p.display().to_string()),
         "png": artifacts.png_path.as_ref().map(|p| p.display().to_string()),
         "text_bytes": artifacts.text_bytes,
+        "clip": artifacts.clip,
         "console": artifacts.console,
         "console_benign": artifacts.console_benign,
         "network": artifacts.network,
@@ -302,6 +337,22 @@ mod tests {
         let pass = outcome(true, None);
         assert!(!pass.failed());
         assert!(!pass.verified_nothing());
+    }
+
+    #[test]
+    fn resolving_a_snap_keeps_the_crop_it_asked_for() {
+        let snap = SnapStep::Detail {
+            name: Some("chart".to_string()),
+            mode: Some(SnapMode::Png),
+            clip: Some("css=#chart".to_string()),
+            clip_padding: Some(4),
+            clip_min_side: None,
+        };
+        let clip = clip_of(&snap);
+        assert_eq!(clip.selector.as_deref(), Some("css=#chart"));
+        assert_eq!(clip.padding, Some(4));
+        assert!(clip.requested());
+        assert!(!clip_of(&SnapStep::Named("plain".to_string())).requested());
     }
 
     #[test]

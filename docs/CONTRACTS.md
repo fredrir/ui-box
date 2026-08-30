@@ -99,6 +99,7 @@ vocabulary and the selector grammar; the core does not interpret either.
       - wait_for: "text=Welcome"
       - assert_text: "text=Welcome"
       - assert_absent: "role=button[name=Clear]"
+      - assert_visible: "role=button[name=Clear]"
       - snap: { name: after-submit, mode: text }
 
 `assert_absent` asserts an element is NOT present. Conditional rendering is most
@@ -272,7 +273,7 @@ Frozen so the skill and the hooks are not written against a guess.
     ui-box wake   [--lab NAME]
     ui-box open   <target> [--surface web|tauri|tui] [--viewport WxH] [--forward SPEC]
     ui-box act    <session> <step...>
-    ui-box snap   <session> [--mode text|png|both] [--name NAME]
+    ui-box snap   <session> [--mode text|png|both|layout] [--name NAME] [--clip SEL]
     ui-box eval   <session> <expr>
     ui-box close  <session>
     ui-box record <session|runid> [--format uibox|playwright] [-o FILE]

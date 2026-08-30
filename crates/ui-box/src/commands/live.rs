@@ -177,9 +177,19 @@ pub fn snap(config: &Config, args: &SnapArgs) -> Result<Summary> {
     let run = RunDir::open(&config.artifacts, &record.id)?;
     let conn = record.connect(config.rpc_timeout)?;
 
+    if args.clip.is_some() && !args.mode.wants_png() {
+        bail!(
+            "--clip crops the png, and --mode {} does not take one. \
+             Pass --mode png or --mode both to crop, or drop --clip",
+            args.mode
+        );
+    }
     let step = Step::Snap(SnapStep::Detail {
         name: args.name.clone(),
         mode: Some(args.mode),
+        clip: args.clip.clone(),
+        clip_padding: args.clip_padding,
+        clip_min_side: args.clip_min_side,
     });
     let mut executor = Executor::new(conn, run, record.driver_session.clone(), record.step_count);
     if record.remote_run_dir.is_some() {

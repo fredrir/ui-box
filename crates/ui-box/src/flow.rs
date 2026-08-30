@@ -18,6 +18,7 @@ pub enum SnapMode {
     Text,
     Png,
     Both,
+    Layout,
 }
 
 impl SnapMode {
@@ -26,11 +27,12 @@ impl SnapMode {
             SnapMode::Text => "text",
             SnapMode::Png => "png",
             SnapMode::Both => "both",
+            SnapMode::Layout => "layout",
         }
     }
 
     pub fn wants_text(&self) -> bool {
-        matches!(self, SnapMode::Text | SnapMode::Both)
+        matches!(self, SnapMode::Text | SnapMode::Both | SnapMode::Layout)
     }
 
     pub fn wants_png(&self) -> bool {
@@ -52,7 +54,8 @@ impl FromStr for SnapMode {
             "text" => Ok(SnapMode::Text),
             "png" => Ok(SnapMode::Png),
             "both" => Ok(SnapMode::Both),
-            other => bail!("unknown snap mode {other:?}, expected text, png or both"),
+            "layout" => Ok(SnapMode::Layout),
+            other => bail!("unknown snap mode {other:?}, expected text, png, both or layout"),
         }
     }
 }
@@ -72,6 +75,12 @@ pub enum SnapStep {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<SnapMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clip: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clip_padding: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clip_min_side: Option<u32>,
     },
 }
 
@@ -89,6 +98,27 @@ impl SnapStep {
             SnapStep::Detail { mode, .. } => *mode,
         }
     }
+
+    pub fn clip(&self) -> Option<&str> {
+        match self {
+            SnapStep::Named(_) => None,
+            SnapStep::Detail { clip, .. } => clip.as_deref(),
+        }
+    }
+
+    pub fn clip_padding(&self) -> Option<u32> {
+        match self {
+            SnapStep::Named(_) => None,
+            SnapStep::Detail { clip_padding, .. } => *clip_padding,
+        }
+    }
+
+    pub fn clip_min_side(&self) -> Option<u32> {
+        match self {
+            SnapStep::Named(_) => None,
+            SnapStep::Detail { clip_min_side, .. } => *clip_min_side,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +130,7 @@ pub enum Step {
     WaitFor(String),
     AssertText(String),
     AssertAbsent(String),
+    AssertVisible(String),
     Snap(SnapStep),
 }
 
@@ -113,12 +144,16 @@ impl Step {
             Step::WaitFor(_) => "wait_for",
             Step::AssertText(_) => "assert_text",
             Step::AssertAbsent(_) => "assert_absent",
+            Step::AssertVisible(_) => "assert_visible",
             Step::Snap(_) => "snap",
         }
     }
 
     pub fn is_assertion(&self) -> bool {
-        matches!(self, Step::AssertText(_) | Step::AssertAbsent(_))
+        matches!(
+            self,
+            Step::AssertText(_) | Step::AssertAbsent(_) | Step::AssertVisible(_)
+        )
     }
 
     pub fn snap(&self) -> Option<&SnapStep> {
@@ -146,6 +181,7 @@ impl Step {
             Step::WaitFor(selector) => format!("wait_for {selector}"),
             Step::AssertText(selector) => format!("assert_text {selector}"),
             Step::AssertAbsent(selector) => format!("assert_absent {selector}"),
+            Step::AssertVisible(selector) => format!("assert_visible {selector}"),
             Step::Snap(snap) => match snap.name() {
                 Some(name) => format!("snap {name}"),
                 None => "snap".to_string(),
@@ -162,6 +198,7 @@ pub const VERBS: &[&str] = &[
     "wait_for",
     "assert_text",
     "assert_absent",
+    "assert_visible",
     "snap",
 ];
 
@@ -176,6 +213,7 @@ impl Serialize for Step {
             Step::WaitFor(selector) => map.serialize_entry("wait_for", selector)?,
             Step::AssertText(selector) => map.serialize_entry("assert_text", selector)?,
             Step::AssertAbsent(selector) => map.serialize_entry("assert_absent", selector)?,
+            Step::AssertVisible(selector) => map.serialize_entry("assert_visible", selector)?,
             Step::Snap(snap) => map.serialize_entry("snap", snap)?,
         }
         map.end()
@@ -209,6 +247,7 @@ impl<'de> Visitor<'de> for StepVisitor {
             "wait_for" => Step::WaitFor(map.next_value()?),
             "assert_text" => Step::AssertText(map.next_value()?),
             "assert_absent" => Step::AssertAbsent(map.next_value()?),
+            "assert_visible" => Step::AssertVisible(map.next_value()?),
             "snap" => Step::Snap(map.next_value()?),
             other => return Err(de::Error::unknown_variant(other, VERBS)),
         };
@@ -233,6 +272,7 @@ pub fn parse_positional(tokens: &[String]) -> Result<Step> {
         "wait_for" => Step::WaitFor(exactly_one(rest, "wait_for SELECTOR")?),
         "assert_text" => Step::AssertText(exactly_one(rest, "assert_text SELECTOR")?),
         "assert_absent" => Step::AssertAbsent(exactly_one(rest, "assert_absent SELECTOR")?),
+        "assert_visible" => Step::AssertVisible(exactly_one(rest, "assert_visible SELECTOR")?),
         "type" => {
             if rest.len() != 2 {
                 bail!("type takes a selector and a text, as in `type \"css=#email\" \"a@b.c\"`");
@@ -246,6 +286,9 @@ pub fn parse_positional(tokens: &[String]) -> Result<Step> {
             0 => Step::Snap(SnapStep::Detail {
                 name: None,
                 mode: None,
+                clip: None,
+                clip_padding: None,
+                clip_min_side: None,
             }),
             1 => Step::Snap(SnapStep::Named(rest[0].clone())),
             _ => bail!("snap takes at most a name, as in `snap after-submit`"),
@@ -413,10 +456,16 @@ steps:
                 Step::Snap(SnapStep::Detail {
                     name: None,
                     mode: None,
+                    clip: None,
+                    clip_padding: None,
+                    clip_min_side: None,
                 }),
                 Step::Snap(SnapStep::Detail {
                     name: None,
                     mode: None,
+                    clip: None,
+                    clip_padding: None,
+                    clip_min_side: None,
                 }),
             ],
         };
@@ -496,6 +545,66 @@ steps:
         assert_eq!(
             parse_positional(&["assert_absent".to_string(), "css=#gone".to_string()]).unwrap(),
             Step::AssertAbsent("css=#gone".into())
+        );
+    }
+
+    #[test]
+    fn layout_is_a_text_mode_that_carries_rectangles() {
+        assert_eq!(SnapMode::from_str("layout").unwrap(), SnapMode::Layout);
+        assert_eq!(SnapMode::Layout.as_str(), "layout");
+        assert!(
+            SnapMode::Layout.wants_text(),
+            "layout is the accessibility tree annotated, so it writes text"
+        );
+        assert!(
+            !SnapMode::Layout.wants_png(),
+            "layout answers the spatial question without the cost of pixels"
+        );
+        assert!(SnapMode::from_str("sideways").is_err());
+    }
+
+    #[test]
+    fn a_positive_visibility_assertion_is_part_of_the_vocabulary() {
+        let step: Step =
+            serde_yaml::from_str("assert_visible: \"role=button[name=Clear]\"").unwrap();
+        assert_eq!(step, Step::AssertVisible("role=button[name=Clear]".into()));
+        assert!(step.is_assertion());
+        assert!(VERBS.contains(&"assert_visible"));
+        assert_eq!(
+            step.to_yaml_entry().unwrap(),
+            "- assert_visible: role=button[name=Clear]\n"
+        );
+        assert_eq!(
+            parse_positional(&["assert_visible".to_string(), "css=#go".to_string()]).unwrap(),
+            Step::AssertVisible("css=#go".into())
+        );
+    }
+
+    #[test]
+    fn a_clip_round_trips_through_a_recorded_step() {
+        let step: Step = serde_yaml::from_str(
+            "snap: { name: chart, mode: png, clip: \"css=#chart\", clip_padding: 4 }",
+        )
+        .unwrap();
+        let snap = step.snap().expect("snap");
+        assert_eq!(snap.clip(), Some("css=#chart"));
+        assert_eq!(snap.clip_padding(), Some(4));
+        assert_eq!(snap.clip_min_side(), None);
+
+        let rendered = step.to_yaml_entry().unwrap();
+        assert!(rendered.contains("clip: css=#chart"), "{rendered}");
+        assert!(
+            !rendered.contains("clip_min_side"),
+            "an unset knob must not appear in a recorded flow: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_snap_without_a_clip_serialises_exactly_as_before() {
+        let step: Step = serde_yaml::from_str("snap: { name: after, mode: text }").unwrap();
+        assert_eq!(
+            step.to_yaml_entry().unwrap(),
+            "- snap:\n    name: after\n    mode: text\n"
         );
     }
 

@@ -193,6 +193,19 @@ pub struct SnapArgs {
 
     #[arg(long, value_enum, default_value_t = SnapMode::Text)]
     pub mode: SnapMode,
+
+    #[arg(
+        long,
+        value_name = "SEL",
+        help = "Crop the png to this element, e.g. 'css=#chart'"
+    )]
+    pub clip: Option<String>,
+
+    #[arg(long, value_name = "PX", help = "Pixels of margin around the crop")]
+    pub clip_padding: Option<u32>,
+
+    #[arg(long, value_name = "PX", help = "Grow a crop smaller than this")]
+    pub clip_min_side: Option<u32>,
 }
 
 #[derive(Debug, Args)]

@@ -43,6 +43,9 @@ fn line(step: &Step) -> String {
         Step::AssertAbsent(selector) => {
             format!("  await expect({}).toHaveCount(0);\n", locator(selector))
         }
+        Step::AssertVisible(selector) => {
+            format!("  await expect({}).toBeVisible();\n", locator(selector))
+        }
         Step::Snap(snap) => format!(
             "  await page.screenshot({{ path: '{}.png' }});\n",
             escape(snap.name().unwrap_or("snapshot"))

@@ -56,6 +56,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     else if (e === 'nul') result = { value: null, kind: 'null', serializable: true };
     else result = { value: { a: 1 }, kind: 'object', serializable: true };
   } else if (verb === 'snap') {
+    if (req.params.clip === 'css=#missing') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id,
+        error: { code: -32000, message: 'clip selector "css=#missing" matched no element; nothing was cropped' } }) + '\n');
+      return;
+    }
     const dir = dirs.get(req.params.sessionId);
     fs.mkdirSync(dir, { recursive: true });
     const base = String(req.params.name || 'snap').replace(/[^A-Za-z0-9._-]/g, '-');
@@ -65,6 +70,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     seen.add(name); used.set(req.params.sessionId, seen);
     const out = {
       name,
+      mode: req.params.mode,
       console: [
         { type: 'error', text: 'real boom' },
         { type: 'error', text: 'noisy extension warning', benign: true },
@@ -77,6 +83,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       fs.writeFileSync(p, tree);
       out.text = tree;
       out.txtPath = p;
+    }
+    if (req.params.clip) {
+      out.clip = {
+        selector: req.params.clip,
+        rect: { x: 10, y: 20, width: 300, height: 120 },
+        padding: req.params.clipPadding ?? 8,
+        scale: 1, upscale: 1,
+        answeredBy: 'css=#chart', retargetedFrom: 'css=#chart-wrap',
+      };
     }
     if (req.params.mode !== 'text') {
       const p = path.join(dir, name + '.png');
@@ -628,6 +643,164 @@ fn a_text_snapshot_carries_its_text_without_a_second_round_trip() {
         inline,
         "the inline text must be the same bytes the file holds"
     );
+
+    ui_box(&dir, &["close", &session]);
+}
+
+#[test]
+fn layout_mode_reaches_the_driver_the_contract_documents() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("mode-layout");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+
+    let output = ui_box(
+        &dir,
+        &["snap", &session, "--name", "shot", "--mode", "layout"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the contract has documented layout since this morning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body = summary(&output);
+    assert_eq!(body["snap"]["mode"], "layout");
+    assert!(
+        body["snap"]["text"].is_string(),
+        "layout is a text mode: {}",
+        body["snap"]
+    );
+
+    ui_box(&dir, &["close", &session]);
+}
+
+#[test]
+fn a_clip_reports_the_rectangle_it_actually_cropped() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("clip-report");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+
+    let body = summary(&ui_box(
+        &dir,
+        &[
+            "snap",
+            &session,
+            "--name",
+            "chart",
+            "--mode",
+            "png",
+            "--clip",
+            "css=#chart",
+            "--clip-padding",
+            "4",
+        ],
+    ));
+    let clip = &body["snap"]["clip"];
+    assert_eq!(clip["rect"]["width"], 300, "{clip}");
+    assert_eq!(clip["rect"]["height"], 120);
+    assert_eq!(
+        clip["padding"], 4,
+        "the padding flag must reach the driver: {clip}"
+    );
+    assert_eq!(
+        clip["answeredBy"], "css=#chart",
+        "a caller has to be able to check the crop covered what they meant: {clip}"
+    );
+    assert_eq!(clip["retargetedFrom"], "css=#chart-wrap");
+
+    ui_box(&dir, &["close", &session]);
+}
+
+#[test]
+fn a_crop_that_cannot_be_located_stays_an_error() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("clip-missing");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+
+    let output = ui_box(
+        &dir,
+        &[
+            "snap",
+            &session,
+            "--name",
+            "gone",
+            "--mode",
+            "png",
+            "--clip",
+            "css=#missing",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a silent full frame when you asked for one element is the bug this feature removes"
+    );
+    let body = summary(&output);
+    assert_eq!(body["error_kind"], "driver_error");
+    assert!(body["error"]
+        .as_str()
+        .expect("error")
+        .contains("matched no element"));
+
+    ui_box(&dir, &["close", &session]);
+}
+
+#[test]
+fn a_clip_without_a_png_is_refused_rather_than_silently_ignored() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("clip-no-png");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+
+    let output = ui_box(
+        &dir,
+        &[
+            "snap",
+            &session,
+            "--name",
+            "t",
+            "--mode",
+            "text",
+            "--clip",
+            "css=#chart",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let message = summary(&output)["error"]
+        .as_str()
+        .expect("error")
+        .to_string();
+    assert!(message.contains("--mode png"), "{message}");
+
+    ui_box(&dir, &["close", &session]);
+}
+
+#[test]
+fn a_positive_visibility_assertion_reaches_the_driver() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("assert-visible");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+
+    let body = summary(&ui_box(
+        &dir,
+        &["act", &session, "assert_visible", "role=button[name=Clear]"],
+    ));
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["verb"], "assert_visible");
 
     ui_box(&dir, &["close", &session]);
 }

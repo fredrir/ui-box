@@ -100,6 +100,19 @@ fn yes() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapClip {
+    pub selector: Option<String>,
+    pub padding: Option<u32>,
+    pub min_side: Option<u32>,
+}
+
+impl SnapClip {
+    pub fn requested(&self) -> bool {
+        self.selector.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SnapResult {
     #[serde(default)]
@@ -405,11 +418,26 @@ impl Connection {
         serde_json::from_value(value).context("driver act is not {ok, error?}")
     }
 
-    pub fn snap(&mut self, session: &str, mode: &str, name: &str) -> Result<SnapResult> {
-        let value = self.call(
-            "snap",
-            json!({ "sessionId": session, "mode": mode, "name": name }),
-        )?;
+    pub fn snap(
+        &mut self,
+        session: &str,
+        mode: &str,
+        name: &str,
+        clip: &SnapClip,
+    ) -> Result<SnapResult> {
+        let mut params = json!({ "sessionId": session, "mode": mode, "name": name });
+        if let Some(map) = params.as_object_mut() {
+            if let Some(selector) = &clip.selector {
+                map.insert("clip".to_string(), json!(selector));
+            }
+            if let Some(padding) = clip.padding {
+                map.insert("clipPadding".to_string(), json!(padding));
+            }
+            if let Some(min_side) = clip.min_side {
+                map.insert("clipMinSide".to_string(), json!(min_side));
+            }
+        }
+        let value = self.call("snap", params)?;
         if value.is_null() {
             return Ok(SnapResult::default());
         }
