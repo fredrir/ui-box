@@ -1,0 +1,718 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set dotenv-load
+
+# Every recipe here runs on archie. libvirt, the storage root and the state
+# share are all there; there is no qemu:///system on the Mac for any of this to
+# talk to, and `just doctor` is the recipe that says so first.
+#
+#   host           archie
+#   repo           /home/fredrir/packages/ui-box
+#   libvirt        qemu:///system
+#   storage root   /home/fredrir/ui-box-state   (never inside the repo)
+#   pool           ui-box                       (distro-lab owns `images`)
+#   network        dlab                         (distro-lab owns it; by name only)
+#   tools          nix develop .#backend
+#
+# Not merely a preference. The domain records the absolute path of whichever
+# checkout applied it: <filesystem><binary path> resolves through abspath(), so
+# an apply from the Mac writes /Users/... into a domain on a Linux host and
+# produces one that cannot start — libvirt spawns that binary as root and the
+# path is not there. The failure surfaces as a start failure with nothing
+# pointing back at the machine that applied it.
+#
+# To get the Mac's tree here, run `just sync` on the Mac. It carries the
+# excludes and derives the .git decision, both of which have to be right on
+# every invocation rather than once. By hand, if you must:
+#
+#   rsync -az --delete --exclude backend/.env --exclude .git \
+#     --exclude target/ --exclude node_modules/ --exclude .venv/ \
+#     --exclude result --exclude .terraform/ \
+#     <mac>/ui-box/ archie:/home/fredrir/packages/ui-box/
+#
+# backend/.env exists only on archie, and --delete removes whatever the source
+# lacks; losing it breaks every verb that drives libvirt. Drop --exclude .git
+# only once nothing below the flake root is untracked; `just sync` works that
+# out rather than being told.
+
+# One VM, so its name is read once here rather than passed to every recipe.
+# lab.json is the single source of truth the NixOS image and the tofu stack
+# both read; nothing below may disagree with it.
+vm := `jq -r .name lab.json`
+ip := `jq -r '"\(.net.subnet_prefix).\(.net.host)"' lab.json`
+
+# The flake root is one level up. Recipes run in backend/, so anything nix
+# touches has to cd there first.
+repo := parent_directory(justfile_directory())
+
+# Where `just sync` pushes to, and where every other verb expects to be running.
+archie_host := "archie"
+archie_repo := "/home/fredrir/packages/ui-box"
+
+# Where the base image, the volumes and the state share live. Outside the repo,
+# because a path: flake reference would copy the whole of it into the store.
+#
+# Defaulted rather than required, because `just sync` is the one verb that runs
+# on the Mac, where no .env belongs — a global dotenv-required would make the
+# verb that delivers .env to archie impossible to run without one.
+store := env("TF_VAR_storage_path", "")
+
+# So the recipes that do need it say which file is missing and where it goes.
+# `set dotenv-required` aborts with nothing naming the cause, which is exactly
+# how a deleted .env presented the last time it happened.
+need_env := '''
+if [[ -z "${TF_VAR_storage_path:-}" || -z "${TF_VAR_libvirt_uri:-}" ]]; then
+    echo "no backend/.env on this host, or it is missing TF_VAR_storage_path/TF_VAR_libvirt_uri" >&2
+    echo "it belongs on archie at /home/fredrir/packages/ui-box/backend/.env" >&2
+    echo "start from backend/.env.example; note that just sync never copies it" >&2
+    exit 1
+fi
+'''
+
+[private]
+default:
+    @just --list
+
+# Push this checkout to archie, where every other verb runs
+[group('lifecycle')]
+sync *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # --delete makes syncing a checkout over itself destructive rather than
+    # merely pointless, so refuse both ways of arriving at that.
+    if [[ "{{ repo }}" -ef "{{ archie_repo }}" ]]; then
+        echo "refusing: {{ repo }} is already {{ archie_repo }}; there is nothing to push" >&2
+        exit 1
+    fi
+    here=$(uname -n); here=${here%%.*}
+    if [[ "$here" == "{{ archie_host }}" ]]; then
+        echo "refusing: this is {{ archie_host }}, the target. just sync runs on the Mac" >&2
+        exit 1
+    fi
+
+    excludes=(
+        # Exists only on archie, created there and gitignored, so --delete would
+        # take it and break every verb that drives libvirt. This one is
+        # load-bearing every single time; it has already cost a restore once.
+        --exclude backend/.env
+
+        # Build output, regenerated on the far side and large.
+        --exclude target/
+        --exclude node_modules/
+        --exclude .venv/
+        --exclude .pytest_cache/
+        --exclude result
+
+        # Provider binaries are per-platform: the Mac's darwin_arm64 is useless
+        # on Linux, and `tofu init` fetches linux_amd64 on archie anyway. An
+        # earlier sync put a 25M darwin binary there that --delete then could
+        # not remove, because --delete does not touch excluded paths.
+        --exclude .terraform/
+    )
+
+    # .git decides how nix reads the flake on archie: with one present, `nix
+    # build .#` resolves to git+file:// and sees tracked files only; without
+    # one it reads a plain path and sees everything. So .git is safe to send
+    # exactly when nothing below the flake root is untracked — the same
+    # predicate `just image` guards on — and hides files otherwise. Derived
+    # rather than remembered, so it expires by itself when backend/ lands.
+    # Two conditions, positive one first. `ls-files --others` can transiently
+    # come back empty while a commit is in flight, and "nothing is untracked"
+    # must not be enough on its own to conclude .git is safe — that would send
+    # it in the one window where it hides the most. Asking instead whether the
+    # flake's backend entry point is in the index cannot be satisfied by a
+    # transient, and it is the thing nix actually needs to be able to see.
+    # Staged-but-uncommitted counts, because git+file reads the index.
+    untracked=""
+    send_git=1
+    if git -C "{{ repo }}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        untracked=$(git -C "{{ repo }}" ls-files --others --exclude-standard)
+        git -C "{{ repo }}" ls-files --error-unmatch backend/nixos/default.nix >/dev/null 2>&1 \
+            && [[ -z "$untracked" ]] \
+            || send_git=0
+    fi
+
+    if (( ! send_git )); then
+        # The one combination an exclude cannot repair: --delete leaves excluded
+        # paths alone, so a .git already on archie stays and goes on hiding
+        # these files however many times this runs.
+        if ssh "{{ archie_host }}" "test -e {{ archie_repo }}/.git"; then
+            echo "{{ archie_host }} already has a .git, but the flake root here is not fully tracked:" >&2
+            [[ -n "$untracked" ]] && sed 's/^/  /' <<<"$untracked" >&2
+            echo "nix reads that as a git+file flake and would evaluate it without them" >&2
+            echo "stage them (git add -N <files>), or rm -rf {{ archie_repo }}/.git" >&2
+            exit 1
+        fi
+        excludes+=(--exclude .git)
+        echo "note  holding .git back: flake root not fully tracked, ${untracked:+$(wc -l <<<"$untracked" | tr -d ' ') }untracked file(s) would be invisible to a git+file flake"
+    fi
+
+    rsync -az --delete "${excludes[@]}" {{ args }} "{{ repo }}/" "{{ archie_host }}:{{ archie_repo }}/"
+    echo "synced {{ repo }} -> {{ archie_host }}:{{ archie_repo }}"
+
+# Build the NixOS disk image into the storage root
+[group('lifecycle')]
+image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ need_env }}
+    cd "{{ repo }}"
+
+    # A git+file flake sees tracked files only, so an untracked one is invisible
+    # to the build and the image silently comes out without it. With no .git
+    # there is nothing to hide: nix reads the directory as a plain path and
+    # copies it whole, so the guard does not apply and must not abort.
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        untracked=$(git ls-files --others --exclude-standard)
+        if [[ -n "$untracked" ]]; then
+            echo "untracked files below the flake root are invisible to a git+file flake:" >&2
+            sed 's/^/  /' <<<"$untracked" >&2
+            echo "stage them first: git add -N <files>" >&2
+            exit 1
+        fi
+    else
+        echo "note  {{ repo }} is not a git checkout; nix copies it whole, nothing is hidden"
+    fi
+
+    # Pin the system rather than the image. `just deploy` builds
+    # system.build.toplevel and pushes that closure, so it is the thing worth
+    # keeping realised between deploys — and it is a third of the size. The
+    # image is a one-shot input to the compressed base below.
+    nix build ".#nixosConfigurations.{{ vm }}.config.system.build.toplevel" \
+        --out-link "{{ store }}/images/.gcroot-{{ vm }}"
+
+    # The root is a thin overlay on the base and libvirt keeps it open for as
+    # long as the domain exists, so a base can never be rewritten in place.
+    # Name it after the build it came from and let a new one land beside the
+    # old: the tofu stack reads the same store path and points the next
+    # `just apply` at whichever base is current.
+    #
+    # Evaluated rather than built, because the name is settled at eval time. An
+    # image whose base is already written is one there is no reason to realise.
+    #
+    # --offline because this reads locked inputs and nothing else; the build
+    # above has already fetched everything it could need.
+    store_path=$(nix eval --offline --raw ".#packages.x86_64-linux.image-{{ vm }}.outPath")
+    stamp=$(basename "$store_path")
+    base="{{ store }}/images/{{ vm }}-base-${stamp:0:8}.qcow2"
+
+    build_link="{{ store }}/images/.gcroot-{{ vm }}.build"
+    cleanup() { rm -f "$build_link" "$base.partial"; }
+    trap cleanup EXIT
+
+    if [[ -f "$base" ]]; then
+        echo "{{ vm }}: $(basename "$base") is already current"
+    else
+        out=$(nix build ".#packages.x86_64-linux.image-{{ vm }}" \
+            --out-link "$build_link" --print-out-paths)
+
+        # The overlay declares disk_size_bytes and qcow2 reads past the end of a
+        # backing file as zeroes, so the base is left at its natural size rather
+        # than resized. The one thing that cannot happen is a base larger than
+        # the overlay that sits on it.
+        want=$(jq -r .disk_size_bytes "{{ justfile_directory() }}/lab.json")
+        have=$(qemu-img info --output=json "$out/{{ vm }}.qcow2" | jq -r '.["virtual-size"]')
+        if (( have > want )); then
+            echo "{{ vm }}: the built image is $(numfmt --to=iec "$have") virtual, over lab.json's disk_size_bytes ($(numfmt --to=iec "$want"))" >&2
+            echo "an overlay cannot be smaller than its base; raise disk_size_bytes" >&2
+            exit 1
+        fi
+
+        # zstd rather than the plain qcow2 the flake builds: the base is
+        # read-only under the overlay, so this costs one decompress per cluster
+        # read and takes about two thirds off the file.
+        qemu-img convert -c -O qcow2 -o compression_type=zstd \
+            "$out/{{ vm }}.qcow2" "$base.partial"
+        chmod 0644 "$base.partial"
+        mv "$base.partial" "$base"
+    fi
+    printf '%s\n' "$store_path" > "{{ store }}/images/{{ vm }}-base.store-path"
+    virsh -c "$TF_VAR_libvirt_uri" pool-refresh "$TF_VAR_pool" >/dev/null 2>&1 || true
+
+    # An older base stays until nothing is backed by it. A root still naming one
+    # has not been applied against the new image yet, and taking it away would
+    # take the guest's disk with it.
+    if virsh -c "$TF_VAR_libvirt_uri" pool-info "$TF_VAR_pool" >/dev/null 2>&1; then
+        # Guard on the pool separately: a libvirt we cannot reach must not read
+        # as "nothing is using these".
+        live=""
+        if xml=$(virsh -c "$TF_VAR_libvirt_uri" vol-dumpxml "{{ vm }}.qcow2" "$TF_VAR_pool" 2>/dev/null); then
+            live=$(sed -n '/<backingStore>/,/<\/backingStore>/p' <<<"$xml" \
+                | sed -n 's:.*<path>\(.*\)</path>.*:\1:p')
+        fi
+        shopt -s nullglob
+        for old in "{{ store }}/images/{{ vm }}"-base-*.qcow2; do
+            if [[ "$old" == "$base" ]]; then
+                continue
+            elif [[ "$old" == "$live" ]]; then
+                echo "keeping $(basename "$old"): {{ vm }} is still backed by it, run: just apply"
+            else
+                rm -f "$old"
+                echo "removed stale base $(basename "$old")"
+            fi
+        done
+    else
+        echo "note  cannot reach pool $TF_VAR_pool, leaving older bases in place" >&2
+    fi
+
+    # Reported by stat rather than read out of the file: libvirt hands the whole
+    # backing chain to the qemu user when the domain first boots and does not
+    # hand it back, so re-running this must not depend on opening the base.
+    printf '%s  %s compressed\n' "$(basename "$base")" "$(du -h "$base" | cut -f1)"
+
+# Reconcile libvirt with the tofu stack
+[group('lifecycle')]
+apply *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ need_env }}
+    mkdir -p "{{ store }}/images" "{{ store }}/storage/{{ vm }}/state"
+
+    # The root is an overlay, so a base the VM is not already sitting on means
+    # tofu replaces that root. Unlinking a volume under a running guest leaves
+    # it writing into an inode nothing can reach any more, so take the VM down
+    # first — and only then, because an apply that replaces nothing has no
+    # business stopping a VM someone is using.
+    stamp="{{ store }}/images/{{ vm }}-base.store-path"
+    if [[ -f "$stamp" ]]; then
+        h=$(basename "$(cat "$stamp")")
+        want="{{ store }}/images/{{ vm }}-base-${h:0:8}.qcow2"
+        have=""
+        if xml=$(virsh -c "$TF_VAR_libvirt_uri" vol-dumpxml "{{ vm }}.qcow2" "$TF_VAR_pool" 2>/dev/null); then
+            have=$(sed -n '/<backingStore>/,/<\/backingStore>/p' <<<"$xml" \
+                | sed -n 's:.*<path>\(.*\)</path>.*:\1:p')
+        fi
+        [[ "$want" == "$have" ]] || just quiesce
+    fi
+
+    # A saved RAM image cannot survive its disk being replaced underneath it.
+    virsh -c "$TF_VAR_libvirt_uri" managedsave-remove "{{ vm }}" 2>/dev/null || true
+
+    tofu -chdir=tofu apply {{ args }}
+
+# Boot the VM and wait for it to answer on SSH
+[group('lifecycle')]
+up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ need_env }}
+    mkdir -p "{{ store }}/storage/{{ vm }}/state"
+    state=$(virsh -c "$TF_VAR_libvirt_uri" domstate "{{ vm }}" 2>/dev/null || echo undefined)
+
+    if [[ "$state" != running && "${UIBOX_FORCE:-0}" != 1 ]]; then
+        need=$(jq -r '.current_memory_mib // 4096' lab.json)
+        avail=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
+        reserve=4096
+        if (( avail - reserve < need )); then
+            echo "refusing to start {{ vm }}: needs ${need} MiB, only $(( avail - reserve )) MiB spendable (${avail} MiB available, ${reserve} MiB reserved for the host)" >&2
+            echo "that is the boot balloon target; growing it later costs more." >&2
+            # Every running domain, not just this one. The host is shared with
+            # distro-lab's labs and they are the likely reason there is no room.
+            echo "awake now:" >&2
+            for d in $(virsh -c "$TF_VAR_libvirt_uri" list --name); do
+                info=$(virsh -c "$TF_VAR_libvirt_uri" dominfo "$d" 2>/dev/null || true)
+                kib=$(sed -n 's/^Max memory: *\([0-9]*\).*/\1/p' <<<"$info" | head -1)
+                rss=$(virsh -c "$TF_VAR_libvirt_uri" dommemstat "$d" 2>/dev/null | awk '$1 == "rss" {print $2; exit}')
+                owner=$([[ "$d" == "{{ vm }}" ]] && echo "ui-box, stop with: just down" || echo "not ui-box's, stop it from its own stack")
+                printf '  %-18s ceiling %6s MiB  resident %6s MiB  (%s)\n' \
+                    "$d" "$(( ${kib:-0} / 1024 ))" "$(( ${rss:-0} / 1024 ))" "$owner" >&2
+            done
+            echo "override with UIBOX_FORCE=1 just up" >&2
+            exit 1
+        fi
+    fi
+
+    case "$state" in
+        undefined)   echo "{{ vm }} is not defined, run: just apply" >&2 ; exit 1 ;;
+        running)     ;;
+        paused)      virsh -c "$TF_VAR_libvirt_uri" resume "{{ vm }}" ;;
+        pmsuspended) virsh -c "$TF_VAR_libvirt_uri" dompmwakeup "{{ vm }}" ;;
+        crashed)     virsh -c "$TF_VAR_libvirt_uri" destroy "{{ vm }}" ; virsh -c "$TF_VAR_libvirt_uri" start "{{ vm }}" ;;
+        *)
+            # Same recovery bin/ui-box-wake performs: a saved RAM image that
+            # will not load leaves a VM you cannot reach, and the disk is intact
+            # either way, so discarding it is strictly better than failing.
+            if ! err=$(virsh -c "$TF_VAR_libvirt_uri" start "{{ vm }}" 2>&1); then
+                # grep -q exits on the first match and SIGPIPEs virsh, which
+                # pipefail reports as failure, so match a variable.
+                info=$(virsh -c "$TF_VAR_libvirt_uri" dominfo "{{ vm }}" 2>/dev/null || true)
+                if grep -qi '^Managed save: *yes' <<<"$info"; then
+                    echo "{{ vm }}: restore failed, discarding the saved RAM image" >&2
+                    echo "  $err" >&2
+                    echo "  the disk is intact; this is equivalent to a power cut" >&2
+                    virsh -c "$TF_VAR_libvirt_uri" managedsave-remove "{{ vm }}" >/dev/null 2>&1 || true
+                    virsh -c "$TF_VAR_libvirt_uri" start "{{ vm }}"
+                else
+                    echo "$err" >&2
+                    exit 1
+                fi
+            fi
+            ;;
+    esac
+
+    for _ in $(seq 1 300); do
+        nc -z -w1 "{{ ip }}" 22 2>/dev/null && { echo "{{ vm }} up on {{ ip }}"; exit 0; }
+        sleep 1
+    done
+    echo "{{ vm }} did not answer on {{ ip }}:22" >&2
+    exit 1
+
+# Stop the VM using the idle action from lab.json
+[group('lifecycle')]
+down:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ need_env }}
+    action=$(jq -r '.idle.action // "shutdown"' lab.json)
+    # grep -q exits on the first match and SIGPIPEs virsh, which pipefail then
+    # reports as failure, so read the XML into a variable before matching it.
+    xml=$(virsh -c "$TF_VAR_libvirt_uri" dumpxml "{{ vm }}" 2>/dev/null || true)
+    if grep -q '<hostdev' <<<"$xml"; then
+        action=shutdown
+    fi
+    case "$action" in
+        managedsave) virsh -c "$TF_VAR_libvirt_uri" managedsave "{{ vm }}" ;;
+        none)        echo "{{ vm }} has idle.action none, not stopping" >&2 ;;
+        *)           virsh -c "$TF_VAR_libvirt_uri" shutdown --mode agent,acpi "{{ vm }}" ;;
+    esac
+    rm -f "$HOME/.ssh/cm-"*"@{{ vm }}:"*
+
+# Rebuild the guest in place over SSH, no tofu
+[group('lifecycle')]
+deploy *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{ repo }}"
+    # --target-host pushes the closure and activates it on the guest, so this
+    # never touches the base image and never needs an apply.
+    if command -v nixos-rebuild >/dev/null 2>&1; then
+        nixos-rebuild switch --flake ".#{{ vm }}" --target-host "{{ vm }}" --sudo {{ args }}
+    else
+        nix develop -c nixos-rebuild switch --flake ".#{{ vm }}" --target-host "{{ vm }}" --sudo {{ args }}
+    fi
+
+# SSH into the VM, waking it if it is asleep
+[group('lifecycle')]
+ssh *args:
+    ssh {{ vm }} {{ args }}
+
+# Shut the VM down cleanly so its work disk is flushed, then wait
+[private]
+quiesce:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ need_env }}
+    state=$(virsh -c "$TF_VAR_libvirt_uri" domstate "{{ vm }}" 2>/dev/null || echo undefined)
+    [[ "$state" == running ]] || exit 0
+    echo "quiescing {{ vm }} so buffered writes reach the work disk"
+    virsh -c "$TF_VAR_libvirt_uri" shutdown --mode agent,acpi "{{ vm }}" >/dev/null 2>&1 || true
+    for _ in $(seq 1 120); do
+        if [[ "$(virsh -c "$TF_VAR_libvirt_uri" domstate "{{ vm }}" 2>/dev/null)" == "shut off" ]]; then
+            # A control master outlives the guest it was opened to.
+            rm -f "$HOME/.ssh/cm-"*"@{{ vm }}:"*
+            exit 0
+        fi
+        sleep 1
+    done
+    echo "{{ vm }} did not shut down in 120s; destroying it would lose unflushed writes" >&2
+    exit 1
+
+# Check every host dependency this VM quietly relies on
+[group('lifecycle')]
+doctor:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    fail=0
+    ok()   { printf '  ok    %s\n' "$1"; }
+    bad()  { printf '  FAIL  %s\n' "$1"; fail=1; }
+    note() { printf '  note  %s\n' "$1"; }
+
+    echo "commands"
+    for cmd in tofu virsh nc qemu-img ssh jq; do
+        if command -v "$cmd" >/dev/null 2>&1; then ok "$cmd"; else bad "$cmd not on PATH"; fi
+    done
+    if command -v nixos-rebuild >/dev/null 2>&1; then
+        ok "nixos-rebuild"
+    else
+        bad "nixos-rebuild not on PATH, needed by just deploy; add it to the flake devShell"
+    fi
+
+    echo "spec"
+    if jq -e . lab.json >/dev/null 2>&1; then ok "lab.json parses"; else bad "lab.json is not valid JSON"; fi
+    if [[ "$(jq -r .name lab.json)" == "{{ vm }}" ]]; then
+        ok "lab.json names {{ vm }}"
+    else
+        bad "lab.json changed name since just parsed it; re-run"
+    fi
+    # The archie-side half of what `just sync` decides on the Mac. If this tree
+    # is a git checkout, nix reads it as git+file:// and builds from tracked
+    # files only, so anything untracked here is silently absent from the image.
+    if git -C "{{ repo }}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        u=$(git -C "{{ repo }}" ls-files --others --exclude-standard | wc -l | tr -d ' ')
+        if (( u > 0 )); then
+            bad "$u untracked file(s) under {{ repo }}; nix reads this as a git+file flake and would build without them"
+        else
+            ok "flake root fully tracked"
+        fi
+    else
+        ok "flake root is not a git checkout; nix copies it whole"
+    fi
+
+    echo "storage"
+    store="{{ store }}"
+    repo="{{ repo }}"
+    if [[ "$store" != /* ]]; then
+        bad "TF_VAR_storage_path is not absolute"
+    elif [[ "$store" == "$repo" || "$store" == "$repo"/* ]]; then
+        bad "TF_VAR_storage_path is inside the repo; a path: flake reference would copy the whole image into the nix store"
+    else
+        ok "$store is outside the repo"
+    fi
+    for d in "{{ store }}/images" "{{ store }}/storage/{{ vm }}/state"; do
+        if [[ -d "$d" ]]; then
+            [[ "$(stat -c '%u' "$d")" == "$(id -u)" ]] || bad "$d is not owned by $(id -un)"
+        else
+            bad "$d missing, run: just apply"
+        fi
+    done
+
+    echo "libvirt"
+    # Names the mistake, not the daemon. Unreachable libvirt almost always means
+    # this is being run somewhere that is not archie, and every check below it
+    # will then fail for the same one reason.
+    if virsh -c "$TF_VAR_libvirt_uri" version >/dev/null 2>&1; then
+        ok "$TF_VAR_libvirt_uri reachable"
+    else
+        bad "cannot reach $TF_VAR_libvirt_uri — these verbs run on archie, where libvirt is; on any other host nothing below will pass"
+    fi
+    pool_state=$(virsh -c "$TF_VAR_libvirt_uri" pool-info "$TF_VAR_pool" 2>/dev/null | sed -n 's/^State: *//p')
+    if [[ "$pool_state" == running ]]; then
+        ok "pool $TF_VAR_pool active"
+    else
+        bad "pool $TF_VAR_pool missing or inactive, run: just apply"
+    fi
+    if [[ "$TF_VAR_pool" == images ]]; then
+        bad "TF_VAR_pool is 'images', which distro-lab declares from its own state; use a pool of ui-box's own"
+    fi
+    if virsh -c "$TF_VAR_libvirt_uri" net-info "$TF_VAR_network" >/dev/null 2>&1; then
+        ok "network $TF_VAR_network defined"
+    else
+        bad "network $TF_VAR_network missing; distro-lab's shared stack owns it"
+    fi
+
+    echo "environment"
+    declared=$(sed -n 's/^variable "\(.*\)".*/\1/p' tofu/variables.tf | sort -u)
+    missing=0
+    for var in $declared; do
+        name="TF_VAR_$var"
+        if [[ -z "${!name:-}" ]]; then bad "$name unset"; missing=1; fi
+    done
+    (( missing )) || ok "all $(wc -w <<<"$declared") declared variables set"
+    unexpanded=$(env | grep '^TF_VAR_' | grep -c '\${')
+    if (( unexpanded == 0 )); then
+        ok "no unexpanded references in .env"
+    else
+        bad "$unexpanded TF_VAR_* still contain \${...}, just did not expand .env"
+    fi
+
+    echo "ssh"
+    for f in bin/ui-box-wake bin/ui-box-idle-stop bin/ui-box-virtiofsd; do
+        if [[ -x "$f" ]]; then ok "$f"; else bad "$f missing or not executable"; fi
+    done
+    if [[ -e "$HOME/.ssh/config.d/20-ui-box-backend-host" ]]; then
+        ok "~/.ssh/config.d/20-ui-box-backend-host"
+    else
+        bad "~/.ssh/config.d/20-ui-box-backend-host missing, symlink backend/ssh/20-ui-box-backend-host"
+    fi
+    # `Host dlab-*` no longer matches this VM, so a fragment of its own is the
+    # only thing that gives it a ProxyCommand.
+    if ssh -G "{{ vm }}" 2>/dev/null | grep -qi '^proxycommand .*ui-box-wake'; then
+        ok "ssh {{ vm }} resolves to ui-box-wake"
+    else
+        bad "ssh {{ vm }} has no ui-box-wake ProxyCommand; it will not wake on connect"
+    fi
+    shopt -s nullglob
+    stale=("$HOME/.ssh/"cm-*@{{ vm }}:*)
+    if (( ${#stale[@]} == 0 )); then
+        ok "no lingering ssh control masters"
+    else
+        [[ "$(virsh -c "$TF_VAR_libvirt_uri" domstate "{{ vm }}" 2>/dev/null)" == running ]] \
+            || bad "stale control master for stopped {{ vm }}, rm ${stale[*]}"
+    fi
+
+    echo "lifecycle"
+    if systemctl is-enabled ui-box-idle-stop.timer >/dev/null 2>&1; then
+        ok "ui-box-idle-stop.timer enabled"
+    else
+        bad "ui-box-idle-stop.timer not installed, see backend/systemd/"
+    fi
+    # The stopper exits non-zero when the guest has stopped publishing its
+    # markers. It deliberately does not act on that, so a failed unit here is
+    # the only signal that {{ vm }} will never idle down on its own.
+    if [[ "$(systemctl is-failed ui-box-idle-stop.service 2>/dev/null)" == failed ]]; then
+        bad "ui-box-idle-stop.service is failed; the guest is not publishing idle markers, see: journalctl -u ui-box-idle-stop.service"
+    else
+        ok "ui-box-idle-stop.service not in failure"
+    fi
+    if [[ -d /run/ui-box ]]; then
+        ok "/run/ui-box"
+    else
+        bad "/run/ui-box missing, install backend/systemd/ui-box-tmpfiles.conf"
+    fi
+    if [[ "$(systemctl is-enabled libvirt-guests 2>/dev/null)" == enabled ]]; then
+        bad "libvirt-guests is enabled and will restore every VM at host boot"
+    else
+        ok "libvirt-guests disabled"
+    fi
+
+    echo "media"
+    stamp="{{ store }}/images/{{ vm }}-base.store-path"
+    if [[ ! -f "$stamp" ]]; then
+        bad "$stamp missing, run: just image"
+    else
+        h=$(basename "$(cat "$stamp")")
+        b="{{ store }}/images/{{ vm }}-base-${h:0:8}.qcow2"
+        if [[ -f "$b" ]]; then ok "$b"; else bad "$b missing, run: just image"; fi
+    fi
+
+    echo "virtiofs"
+    if [[ -x /usr/lib/virtiofsd ]]; then ok "/usr/lib/virtiofsd"; else bad "virtiofsd missing, pacman -S virtiofsd"; fi
+    if [[ -f /usr/share/qemu/vhost-user/50-virtiofsd.json ]]; then
+        ok "virtiofsd capability descriptor"
+    else
+        bad "no vhost-user descriptor, managedsave of a domain with a share will fail"
+    fi
+    # Root spawns this one, and a domain pointing at a path that is gone will
+    # not start at all, so a moved checkout has to be caught here.
+    defined=$(virsh -c "$TF_VAR_libvirt_uri" dumpxml --inactive "{{ vm }}" 2>/dev/null \
+        | sed -n "s:.*<binary path='\(.*\)'/>.*:\1:p")
+    if [[ -z "$defined" ]]; then
+        bad "{{ vm }} does not use backend/bin/ui-box-virtiofsd; an unlinked file on the share will make managedsave unrestorable, run: just apply"
+    elif [[ "$defined" != *ui-box-virtiofsd ]]; then
+        bad "{{ vm }} points at $defined, which is not ui-box's wrapper"
+    elif [[ -x "$defined" ]]; then
+        ok "$defined"
+    else
+        bad "{{ vm }} points at $defined, which is not executable; the checkout moved, run: just apply"
+    fi
+
+    echo "network"
+    live=$(virsh -c "$TF_VAR_libvirt_uri" net-dumpxml "$TF_VAR_network" 2>/dev/null || true)
+    gw="$(jq -r '"\(.net.subnet_prefix).\(.net.gateway_host)"' lab.json)"
+    if grep -q "address='$gw'" <<<"$live"; then
+        ok "$TF_VAR_network is on $gw, the gateway the image has baked in"
+    else
+        bad "$TF_VAR_network is not on $gw, but the image has that gateway baked in"
+    fi
+
+    # {{ vm }} holds no reservation here on purpose — distro-lab owns this
+    # network and ui-box does not declare it — so the image's static address is
+    # the only thing that puts it on {{ ip }}. Two things must therefore hold:
+    # nothing else may claim that address, and no dynamic range may cover it.
+    if grep -q "ip='{{ ip }}'" <<<"$live"; then
+        bad "{{ ip }} is already reserved in $TF_VAR_network by another stack's guest"
+    else
+        ok "{{ ip }} is claimed by no reservation in $TF_VAR_network"
+    fi
+    mac="52:54:00:$(printf '%s' "{{ vm }}" | md5sum | sed 's/\(..\)\(..\)\(..\).*/\1:\2:\3/')"
+    if grep -qi "mac='$mac'" <<<"$live"; then
+        bad "the derived MAC $mac collides with a reservation in $TF_VAR_network"
+    else
+        ok "derived MAC $mac collides with nothing in $TF_VAR_network"
+    fi
+    ranges=$(sed -n "s:.*<range start='\([0-9.]*\)' end='\([0-9.]*\)'.*:\1 \2:p" <<<"$live")
+    if [[ -z "$ranges" ]]; then
+        ok "$TF_VAR_network has no dynamic DHCP range; dnsmasq serves static hosts only"
+    else
+        octet=$(jq -r .net.host lab.json)
+        covered=0
+        while read -r start end; do
+            [[ -n "$start" ]] || continue
+            if (( ${start##*.} <= octet && octet <= ${end##*.} )); then covered=1; fi
+            note "dynamic range $start-$end"
+        done <<<"$ranges"
+        if (( covered )); then
+            bad "{{ ip }} is inside a dynamic DHCP range and can be leased to another guest; move net.host clear of it"
+        else
+            ok "{{ ip }} is outside every dynamic DHCP range"
+        fi
+    fi
+
+    echo "memory"
+    ksm=$(cat /sys/kernel/mm/ksm/run 2>/dev/null || echo 0)
+    if [[ "$ksm" != 0 ]]; then
+        bad "KSM is on but this VM has a virtiofs share; memfd-shared guest RAM is never scanned"
+    else
+        ok "KSM off (correct: virtiofs forces shared memory backing)"
+    fi
+    if (( $(swapon --show --noheadings | wc -l) > 0 )); then
+        ok "swap present"
+    else
+        bad "no swap: virtiofs guest RAM is unreclaimable shmem, the OOM killer is the only relief. enable zram"
+    fi
+
+    # Every running domain, not only this one. The host is shared with
+    # distro-lab's labs, whose own checks do not count {{ vm }} either, so the
+    # only honest figure is the whole hypervisor's.
+    avail=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
+    committed=0
+    for d in $(virsh -c "$TF_VAR_libvirt_uri" list --name); do
+        info=$(virsh -c "$TF_VAR_libvirt_uri" dominfo "$d" 2>/dev/null || true)
+        kib=$(sed -n 's/^Max memory: *\([0-9]*\).*/\1/p' <<<"$info" | head -1)
+        committed=$(( committed + ${kib:-0} / 1024 ))
+    done
+    note "$committed MiB of ceilings committed by every awake domain, $avail MiB available"
+
+    # A save costs the ceiling rather than the balloon: virtiofs forces
+    # memfd-shared guest RAM, and a read fault on shared shmem allocates, so
+    # managedsave materialises the whole ceiling however little the guest holds.
+    # A ceiling the host cannot find room for does not fail the save cleanly —
+    # the OOM killer takes QEMU mid-write and leaves the domain hard-stopped
+    # with no saved image, a power cut the idle timer performs on a schedule.
+    if [[ "$(virsh -c "$TF_VAR_libvirt_uri" domstate "{{ vm }}" 2>/dev/null)" == running ]] \
+       && [[ "$(jq -r '.idle.action // "managedsave"' lab.json)" == managedsave ]]; then
+        info=$(virsh -c "$TF_VAR_libvirt_uri" dominfo "{{ vm }}" 2>/dev/null || true)
+        ceiling=$(( $(sed -n 's/^Max memory: *\([0-9]*\).*/\1/p' <<<"$info" | head -1) / 1024 ))
+        held=$(( $(virsh -c "$TF_VAR_libvirt_uri" dommemstat "{{ vm }}" 2>/dev/null | awk '/^rss/{print $2}') / 1024 ))
+        need=$(( ceiling - held ))
+        (( need < 0 )) && need=0
+        if (( need <= avail - 4096 )); then
+            ok "{{ vm }} is saveable: needs ${need} MiB more of its ${ceiling} MiB ceiling, $(( avail - 4096 )) MiB spendable"
+        else
+            bad "{{ vm }} cannot be saved: managedsave must materialise ${need} MiB more of its ${ceiling} MiB ceiling and only $(( avail - 4096 )) MiB is spendable; it would be OOM-killed mid-save. stop another domain, or lower memory_mib"
+        fi
+    else
+        ok "nothing to save right now"
+    fi
+
+    exit $fail
+
+# Variables that would be handed to OpenTofu
+[group('tofu')]
+env:
+    @env | grep '^TF_' | sort
+
+# Format the OpenTofu files
+[group('tofu')]
+fmt:
+    tofu fmt -recursive tofu
+
+# Initialise the stack
+[group('tofu')]
+init:
+    @mkdir -p "$TF_PLUGIN_CACHE_DIR" && tofu -chdir=tofu init
+
+# Validate the stack
+[group('tofu')]
+validate:
+    @tofu -chdir=tofu validate
+
+# Plan the stack
+[group('tofu')]
+plan *args:
+    @tofu -chdir=tofu plan {{ args }}
+
+# Show the stack's outputs
+[group('tofu')]
+output:
+    @tofu -chdir=tofu output

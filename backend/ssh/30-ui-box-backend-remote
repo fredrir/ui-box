@@ -1,0 +1,17 @@
+# From the Mac, hopping through archie. Symlink to
+# ~/.ssh/config.d/30-ui-box-backend-remote.
+#
+# The number keeps it ahead of any `Host *` defaults and behind the per-machine
+# routing files that decide how archie itself is reached.
+Host ui-box-backend
+    User fredrir
+    ProxyCommand ssh -T -o LogLevel=ERROR archie /home/fredrir/packages/ui-box/backend/bin/ui-box-wake %h %p
+    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking no
+    LogLevel ERROR
+    ConnectTimeout 300
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 1m

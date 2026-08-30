@@ -1,0 +1,11 @@
+# OpenTofu runtime
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/crash.log
+
+# Keep provider locks!
+# .terraform.lock.hcl SHOULD be committed
+
+# Environment
+/.env

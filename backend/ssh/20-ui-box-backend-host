@@ -1,0 +1,16 @@
+# On archie itself. Symlink to ~/.ssh/config.d/20-ui-box-backend-host.
+#
+# ui-box-backend does not match distro-lab's `Host dlab-*` block any more, so
+# it carries its own. The two never both match a host.
+Host ui-box-backend
+    User fredrir
+    ProxyCommand /home/fredrir/packages/ui-box/backend/bin/ui-box-wake %h %p
+    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking no
+    LogLevel ERROR
+    ConnectTimeout 300
+    ServerAliveInterval 30
+    ServerAliveCountMax 6
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 1m

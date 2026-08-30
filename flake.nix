@@ -201,29 +201,64 @@
           default = ui-box;
         }
         // lib.optionalAttrs isLinux { inherit tauri-driver; };
+
+      hostPackages = eachSystem packagesFor;
     in
     {
-      packages = eachSystem packagesFor;
-
-      devShells = eachSystem (pkgs: {
-        default = pkgs.mkShell {
-          packages = with pkgs; [
-            biome
-            cargo
-            clippy
-            git
-            nodejs_22
-            rust-analyzer
-            rustc
-            rustfmt
-            uv
-          ];
-
-          env.LIBGL_ALWAYS_SOFTWARE = "1";
-          env.PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
-          env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
+      packages = hostPackages // {
+        x86_64-linux = hostPackages.x86_64-linux // {
+          image-ui-box-backend = self.nixosConfigurations.ui-box-backend.config.system.build.image;
         };
-      });
+      };
+
+      # The lab that ui-box's graphical tests run inside. One flake, so the
+      # runner module below and the system importing it resolve one nixpkgs.
+      nixosConfigurations.ui-box-backend = lib.nixosSystem {
+        system = "x86_64-linux";
+
+        modules = [
+          ./backend/nixos
+          self.nixosModules.runner
+        ];
+      };
+
+      devShells = eachSystem (
+        pkgs:
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              biome
+              cargo
+              clippy
+              git
+              nodejs_22
+              rust-analyzer
+              rustc
+              rustfmt
+              uv
+            ];
+
+            env.LIBGL_ALWAYS_SOFTWARE = "1";
+            env.PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+            env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
+          };
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # The lifecycle tools backend/justfile drives the hypervisor with. Kept
+          # out of the default shell because that one is also entered on darwin,
+          # where nixos-rebuild is not a thing anyone can use.
+          backend = pkgs.mkShell {
+            packages = with pkgs; [
+              jq
+              just
+              nixos-rebuild
+              openssh
+              opentofu
+              qemu-utils
+            ];
+          };
+        }
+      );
 
       formatter = eachSystem (pkgs: pkgs.nixfmt);
 
@@ -289,7 +324,7 @@
 
             stateDir = mkOption {
               type = types.path;
-              default = "/var/lib/dlab-state/ui-box";
+              default = "/var/lib/ui-box-state/ui-box";
               description = "UIBOX_HOME: where ui-box reads its global .env.";
             };
 

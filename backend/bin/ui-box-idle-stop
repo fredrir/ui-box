@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# Host side of the idle policy. The guest publishes alive/busy markers into its
+# state share; this reads them and acts on backend/lab.json's idle block.
+set -uo pipefail
+
+VIRSH=/usr/bin/virsh
+JQ=/usr/bin/jq
+URI=qemu:///system
+
+RESERVE_MIB=4096
+ALIVE_MAX=180
+MARKER_FAULT_AFTER=900
+
+REPO=${UIBOX_REPO:-$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/../.." && pwd)}
+SPEC="$REPO/backend/lab.json"
+UIBOX_USER_HOME=${UIBOX_USER_HOME:-/home/fredrir}
+
+log() { printf 'ui-box-idle-stop: %s\n' "$*"; }
+
+[[ -f "$SPEC" ]] || { log "no spec at $SPEC"; exit 1; }
+
+spec() { "$JQ" -r "$1" "$SPEC" 2>/dev/null; }
+
+# The state share sits with the images, outside the checkout.
+env_value() { grep -E "^$1=" "$REPO/backend/.env" 2>/dev/null | sed 's/.*="\?\([^"]*\)"\?$/\1/'; }
+STORE=${UIBOX_STORAGE:-$(env_value TF_VAR_storage_path)}
+[[ -n "$STORE" ]] || { log "no TF_VAR_storage_path in $REPO/backend/.env"; exit 1; }
+
+vm=$(spec '.name')
+[[ -n "$vm" && "$vm" != null ]] || { log "no name in $SPEC"; exit 1; }
+
+action=$(spec '.idle.action // "managedsave"')
+minutes=$(spec '.idle.minutes // 60')
+
+[[ "$action" == none ]] && exit 0
+
+# This runs as root and bin/ui-box-wake runs as the connecting user, so a
+# directory root creates for itself is one the wake path cannot use — it would
+# fall back to its own runtime dir, the two would hold different locks, and a
+# save could land on a connection being established. Converge on what
+# systemd/ui-box-tmpfiles.conf would have made, rather than diverging from it.
+lockdir=/run/ui-box
+if mkdir -p "$lockdir" 2>/dev/null; then
+    chgrp libvirt "$lockdir" 2>/dev/null || true
+    chmod 0775 "$lockdir" 2>/dev/null || true
+fi
+[[ -d "$lockdir" && -w "$lockdir" ]] || lockdir="${XDG_RUNTIME_DIR:-/tmp}/ui-box"
+mkdir -p "$lockdir" 2>/dev/null || true
+
+# Set while the domain runs without publishing, cleared the moment it does or
+# the domain stops. It lives on tmpfs, so a host reboot resets it too.
+unpublished="$lockdir/$vm.unpublished-since"
+
+if [[ "$("$VIRSH" -c "$URI" domstate "$vm" 2>/dev/null)" != running ]]; then
+    rm -f "$unpublished"
+    exit 0
+fi
+
+now=$(date +%s)
+mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+state="$STORE/storage/$vm/state"
+alive="$state/alive"
+busy="$state/busy"
+keep="$state/keepalive"
+
+# A marker that is missing, or frozen, means the guest's publisher is not
+# running — and from here that is indistinguishable from a VM that is simply
+# busy. Never act on absent information: stopping a VM because its publisher
+# broke is worse than leaving it up. But do not stay quiet either, or it holds
+# its ceiling indefinitely and the only symptom is a log line that reads like
+# routine. Past the grace period this exits non-zero, which leaves the oneshot
+# unit in failed state where systemctl and `just doctor` both report it.
+#
+# The grace has to clear a cold boot plus the guest's 15s/30s publish timer,
+# and stay well inside idle.minutes so a broken publisher is reported before
+# the VM would have been stopped anyway.
+if [[ ! -f "$alive" ]]; then
+    [[ -f "$unpublished" ]] || : > "$unpublished"
+    waited=$(( now - $(mtime "$unpublished") ))
+    if (( waited > MARKER_FAULT_AFTER )); then
+        log "$vm: FAULT: running ${waited}s and has never published $alive"
+        log "$vm: the guest's marker unit is not running, or $state is not mounted in the guest"
+        log "$vm: leaving it up; idleness is unknowable while the markers are missing"
+        exit 1
+    fi
+    log "$vm: no alive marker yet (${waited}s), skipping"
+    exit 0
+fi
+
+rm -f "$unpublished"
+
+age=$(( now - $(mtime "$alive") ))
+if (( age > MARKER_FAULT_AFTER )); then
+    log "$vm: FAULT: alive marker has not moved for ${age}s"
+    log "$vm: the guest's marker unit has stopped publishing; leaving it up"
+    exit 1
+fi
+if (( age > ALIVE_MAX )); then
+    log "$vm: alive marker is ${age}s stale, skipping"
+    exit 0
+fi
+
+if [[ -f "$keep" ]]; then
+    until=$(cat "$keep" 2>/dev/null || echo 0)
+    [[ "$until" =~ ^[0-9]+$ ]] || until=0
+    if (( until > now )); then
+        log "$vm: held for another $(( until - now ))s"
+        exit 0
+    fi
+fi
+
+[[ -f "$busy" ]] || { log "$vm: no busy marker yet, skipping"; exit 0; }
+
+idle=$(( now - $(mtime "$busy") ))
+(( idle < minutes * 60 )) && exit 0
+
+# grep -q exits on the first match and SIGPIPEs virsh, which pipefail then
+# reports as failure, so read the XML into a variable before matching it.
+xml=$("$VIRSH" -c "$URI" dumpxml "$vm" 2>/dev/null || true)
+if grep -q '<hostdev' <<<"$xml"; then
+    # libvirt refuses to serialise a domain with an assigned PCI device.
+    action=shutdown
+fi
+
+avail_mib() { awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo; }
+
+dom_ceiling_mib() {
+    local info mib
+    info=$("$VIRSH" -c "$URI" dominfo "$1" 2>/dev/null || true)
+    mib=$(sed -n 's/^Max memory: *\([0-9][0-9]*\).*/\1/p' <<<"$info" | head -1)
+    printf '%s' "$(( ${mib:-0} / 1024 ))"
+}
+
+dom_rss_mib() {
+    local kib
+    kib=$("$VIRSH" -c "$URI" dommemstat "$1" 2>/dev/null | awk '$1 == "rss" {print $2; exit}')
+    printf '%s' "$(( ${kib:-0} / 1024 ))"
+}
+
+# A save costs the ceiling, not the balloon: virtiofs forces memfd-shared guest
+# RAM, and a read fault on shared shmem allocates, so managedsave materialises
+# all of memory_mib however little the guest is holding. A ceiling the host
+# cannot find room for does not fail cleanly — the OOM killer takes QEMU
+# mid-write and leaves the VM hard-stopped with no saved image, which is a
+# power cut performed on a schedule.
+#
+# The memory has to be found on a host shared with distro-lab's labs, so this
+# asks MemAvailable — a host-wide figure that already reflects every running
+# domain — rather than anything scoped to ui-box's own.
+save_fits() {
+    local ceiling held need avail
+    ceiling=$(dom_ceiling_mib "$vm")
+    held=$(dom_rss_mib "$vm")
+    need=$(( ceiling - held ))
+    (( need < 0 )) && need=0
+    avail=$(avail_mib)
+
+    (( need <= avail - RESERVE_MIB )) && return 0
+
+    log "$vm: a save needs ${need} MiB more of its ${ceiling} MiB ceiling and only $(( avail - RESERVE_MIB )) MiB is spendable"
+    for d in $("$VIRSH" -c "$URI" list --name 2>/dev/null); do
+        [[ -n "$d" && "$d" != "$vm" ]] || continue
+        log "  also awake: $d — ceiling $(dom_ceiling_mib "$d") MiB, resident $(dom_rss_mib "$d") MiB"
+    done
+    return 1
+}
+
+(
+    exec 9>"$lockdir/$vm.lock"
+    if ! flock -w 5 9; then
+        log "$vm: lock busy, a connection is probably in flight"
+        exit 0
+    fi
+
+    if [[ "$("$VIRSH" -c "$URI" domstate "$vm" 2>/dev/null)" != running ]]; then
+        exit 0
+    fi
+
+    if (( $(mtime "$busy") > now - minutes * 60 )); then
+        log "$vm: became busy under the lock"
+        exit 0
+    fi
+
+    if [[ "$action" == managedsave ]] && ! save_fits; then
+        log "$vm: shutting down instead; a save that does not fit is a power cut"
+        action=shutdown
+    fi
+
+    case "$action" in
+        managedsave)
+            log "$vm: idle ${idle}s, saving"
+            "$VIRSH" -c "$URI" managedsave "$vm" >/dev/null 2>&1 \
+                || { log "$vm: managedsave failed, falling back to shutdown"
+                     "$VIRSH" -c "$URI" shutdown --mode agent,acpi "$vm" >/dev/null 2>&1 || true; }
+            ;;
+        shutdown)
+            log "$vm: idle ${idle}s, shutting down"
+            "$VIRSH" -c "$URI" shutdown --mode agent,acpi "$vm" >/dev/null 2>&1 || true
+            ;;
+    esac
+
+    rm -f "$UIBOX_USER_HOME/.ssh/cm-"*"@$vm:"* 2>/dev/null || true
+)

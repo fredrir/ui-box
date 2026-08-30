@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# virtiofsd, wrapped so a managed save can be restored.
+#
+# libvirt spawns virtiofsd itself and offers no XML knob for its migration
+# flags, so the only seam is <binary path>. Everything here is a default this
+# host wants and libvirt cannot express; the arguments libvirt builds are
+# appended untouched.
+set -euo pipefail
+
+for candidate in /usr/lib/virtiofsd /usr/libexec/virtiofsd /usr/bin/virtiofsd; do
+    if [[ -x "$candidate" ]]; then
+        virtiofsd=$candidate
+        break
+    fi
+done
+
+: "${virtiofsd:?no virtiofsd found in /usr/lib, /usr/libexec or /usr/bin}"
+
+# A managed save serialises the guest's open inodes as paths relative to the
+# share. An inode the guest still holds open but has unlinked has no path left
+# to write down, and the default --migration-on-error is abort: the save
+# succeeds, the restore fails on it, and the VM cannot be started again until
+# the RAM image is discarded — a power cut caused by one deleted scratch file.
+# Measured: a single unlinked-but-open fd on the share is enough.
+#
+# guest-error confines the damage to the inode that caused it. The restore
+# completes, and the guest sees errors only on that one fd, which was already
+# unreachable by name and unopenable by anything else.
+exec "$virtiofsd" --migration-on-error guest-error "$@"

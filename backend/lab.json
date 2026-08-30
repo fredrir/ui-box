@@ -1,0 +1,20 @@
+{
+  "name": "ui-box-backend",
+  "net": {
+    "subnet_prefix": "192.168.123",
+    "prefix_length": 24,
+    "gateway_host": 1,
+    "domain": "dlab",
+    "host": 60
+  },
+  "memory_mib": 6144,
+  "current_memory_mib": 4096,
+  "vcpu": 8,
+  "vcpu_current": 4,
+  "disk_size_bytes": 107374182400,
+  "work_disk_bytes": 53687091200,
+  "idle": {
+    "minutes": 30,
+    "action": "managedsave"
+  }
+}

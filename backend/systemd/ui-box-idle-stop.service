@@ -1,0 +1,8 @@
+[Unit]
+Description=Stop ui-box-backend when it goes idle
+After=libvirtd.service
+Wants=libvirtd.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/fredrir/packages/ui-box/backend/bin/ui-box-idle-stop

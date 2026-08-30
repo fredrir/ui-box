@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# ProxyCommand for ui-box-backend: start or restore the VM, wait for ssh, then
+# become a nc to the guest. Nothing here reaches into distro-lab.
+set -uo pipefail
+
+VIRSH=/usr/bin/virsh
+JQ=/usr/bin/jq
+NC=/usr/bin/nc
+URI=qemu:///system
+
+RESERVE_MIB=4096
+
+REPO=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/../.." && pwd)
+SPEC="$REPO/backend/lab.json"
+
+[[ -f "$SPEC" ]] || { printf 'ui-box: no spec at %s\n' "$SPEC" >&2; exit 1; }
+
+spec() { "$JQ" -r "$1" "$SPEC" 2>/dev/null; }
+
+vm=$(spec '.name')
+[[ -n "$vm" && "$vm" != null ]] || { printf 'ui-box: no name in %s\n' "$SPEC" >&2; exit 1; }
+
+host="${1:-$vm}"
+port="${2:-22}"
+
+STATE_DIR="$HOME/.local/state/ui-box"
+mkdir -p "$STATE_DIR"
+LOG="$STATE_DIR/$vm.log"
+
+say() { printf 'ui-box: %s\n' "$*" >&2; printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG"; }
+die() { say "$*"; exit 1; }
+
+[[ "$host" == "$vm" ]] || die "asked for $host but this proxy only serves $vm"
+
+prefix=$(spec '.net.subnet_prefix')
+octet=$(spec '.net.host')
+[[ -n "$prefix" && "$prefix" != null ]] || die "no net.subnet_prefix in $SPEC"
+[[ "$octet" =~ ^[0-9]+$ ]] || die "no net.host in $SPEC"
+
+ip="$prefix.$octet"
+
+# The state share sits with the images, outside the checkout.
+env_value() { grep -E "^$1=" "$REPO/backend/.env" 2>/dev/null | sed 's/.*="\?\([^"]*\)"\?$/\1/'; }
+STORE=${UIBOX_STORAGE:-$(env_value TF_VAR_storage_path)}
+
+domstate() { "$VIRSH" -c "$URI" domstate "$vm" 2>/dev/null || echo undefined; }
+
+# Read the whole answer before matching it: grep -q exits on the first match and
+# SIGPIPEs virsh, and pipefail reports that as failure, so piping straight into
+# it would claim there is no saved image and skip the recovery below.
+has_managed_save() {
+    local info
+    info=$("$VIRSH" -c "$URI" dominfo "$vm" 2>/dev/null || true)
+    grep -qi '^Managed save: *yes' <<<"$info"
+}
+
+wait_for_ssh() {
+    local i
+    for ((i = 0; i < 300; i++)); do
+        "$NC" -z -w1 "$ip" "$port" 2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
+keepalive() {
+    local share="$STORE/storage/$vm/state"
+    [[ -n "$STORE" && -d "$share" ]] || return 0
+    date -d '+10 minutes' +%s >"$share/keepalive" 2>/dev/null || true
+}
+
+# Both of these fail the domain start, not the guest boot: libvirt spawns
+# virtiofsd before the guest runs at all, and virtiofsd cannot serve a directory
+# that is not there. So this holds however the guest mounts the share — the
+# guest never gets far enough to have an opinion. libvirt reports both as a
+# virtiofsd spawn failure, which names the daemon rather than the thing to do
+# about it, so say the thing to do about it.
+#
+# Skipped rather than fatal when STORE is unknown: the share path is baked into
+# the domain XML, so a start can succeed even when this script cannot read .env.
+preflight() {
+    if [[ -n "$STORE" ]]; then
+        local share="$STORE/storage/$vm/state"
+        [[ -d "$share" ]] \
+            || die "$share is missing; virtiofsd cannot serve it and libvirt will not start the domain. run: just apply"
+    fi
+
+    [[ -x /usr/lib/virtiofsd || -x /usr/libexec/virtiofsd || -x /usr/bin/virtiofsd ]] \
+        || die "no virtiofsd in /usr/lib, /usr/libexec or /usr/bin; libvirt cannot start a domain with a virtiofs share without it"
+}
+
+avail_mib() { awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo; }
+
+# "Max memory" from dominfo, in MiB. The ceiling rather than the balloon: it is
+# what a managedsave has to materialise, and what the domain may inflate to.
+dom_ceiling_mib() {
+    local info mib
+    info=$("$VIRSH" -c "$URI" dominfo "$1" 2>/dev/null || true)
+    mib=$(sed -n 's/^Max memory: *\([0-9][0-9]*\).*/\1/p' <<<"$info" | head -1)
+    printf '%s' "$(( ${mib:-0} / 1024 ))"
+}
+
+dom_rss_mib() {
+    local kib
+    kib=$("$VIRSH" -c "$URI" dommemstat "$1" 2>/dev/null | awk '$1 == "rss" {print $2; exit}')
+    printf '%s' "$(( ${kib:-0} / 1024 ))"
+}
+
+# Every running domain on the hypervisor, not just this one. The host is shared
+# with distro-lab's labs; distro-lab's own checks do not count this VM, so a
+# check here that only counted ui-box's would leave both sides blind to the
+# other and neither able to explain a refusal.
+report_awake() {
+    local d ceiling rss owner any=0
+    while read -r d; do
+        [[ -n "$d" ]] || continue
+        any=1
+        ceiling=$(dom_ceiling_mib "$d")
+        rss=$(dom_rss_mib "$d")
+        if [[ "$d" == "$vm" ]]; then owner="ui-box"; else owner="not ui-box's"; fi
+        say "  awake: $d — ceiling ${ceiling} MiB, resident ${rss} MiB ($owner)"
+    done < <("$VIRSH" -c "$URI" list --name 2>/dev/null)
+    (( any )) || say "  awake: nothing"
+}
+
+budget_ok() {
+    [[ "${UIBOX_FORCE:-0}" == 1 ]] && return 0
+
+    local need avail
+    # Admit against the VM's configured boot allocation, not its hotplug
+    # ceiling. It starts well below memory_mib and can grow later.
+    need=$(spec '.current_memory_mib // .memory_mib // 4096')
+    avail=$(avail_mib)
+
+    (( avail - RESERVE_MIB >= need )) && return 0
+
+    say "refusing to start $vm: needs ${need} MiB, only $(( avail - RESERVE_MIB )) MiB spendable"
+    say "(${avail} MiB available, ${RESERVE_MIB} MiB reserved for the host)"
+    report_awake
+    say "stop one of ui-box's with 'just down'; anything else belongs to another"
+    say "stack on this host and has to be stopped there. Override with UIBOX_FORCE=1"
+    return 1
+}
+
+start_locked() {
+    local state discarded=0
+    state=$(domstate)
+
+    case "$state" in
+        running) return 0 ;;
+        undefined) die "$vm is not defined, run: just apply" ;;
+    esac
+
+    preflight
+    budget_ok || exit 1
+
+    case "$state" in
+        paused)
+            "$VIRSH" -c "$URI" resume "$vm" >/dev/null 2>&1 || die "resume failed"
+            ;;
+        pmsuspended)
+            "$VIRSH" -c "$URI" dompmwakeup "$vm" >/dev/null 2>&1 || die "wakeup failed"
+            ;;
+        "in shutdown")
+            say "waiting for in-progress shutdown"
+            local i
+            for ((i = 0; i < 120; i++)); do
+                [[ "$(domstate)" == "shut off" ]] && break
+                sleep 1
+            done
+            "$VIRSH" -c "$URI" start "$vm" >/dev/null 2>&1 || die "start after shutdown failed"
+            ;;
+        crashed)
+            say "domain was crashed, recreating"
+            "$VIRSH" -c "$URI" destroy "$vm" >/dev/null 2>&1 || true
+            "$VIRSH" -c "$URI" start "$vm" >/dev/null 2>&1 || die "start after crash failed"
+            ;;
+        *)
+            local err
+            if ! err=$("$VIRSH" -c "$URI" start "$vm" 2>&1); then
+                if grep -qi "already active" <<<"$err"; then
+                    :
+                elif has_managed_save; then
+                    say "restore failed, discarding the saved RAM image: $err"
+                    say "the disk is intact; this is equivalent to a power cut"
+                    "$VIRSH" -c "$URI" managedsave-remove "$vm" >/dev/null 2>&1 || true
+                    date -Is >"$STATE_DIR/$vm.restore-failed"
+                    discarded=1
+                    "$VIRSH" -c "$URI" start "$vm" >/dev/null 2>&1 \
+                        || die "cold start after discarding the save also failed"
+                else
+                    die "start failed: $err"
+                fi
+            fi
+            ;;
+    esac
+
+    keepalive
+    wait_for_ssh || die "$vm started but never answered on $ip:$port"
+    (( discarded )) && say "recovered by cold start; see $STATE_DIR/$vm.restore-failed"
+    return 0
+}
+
+if [[ "$(domstate)" == running ]] && "$NC" -z -w1 "$ip" "$port" 2>/dev/null; then
+    exec "$NC" "$ip" "$port"
+fi
+
+lockdir=/run/ui-box
+[[ -d "$lockdir" && -w "$lockdir" ]] || lockdir="${XDG_RUNTIME_DIR:-/tmp}/ui-box"
+mkdir -p "$lockdir"
+
+exec 9>"$lockdir/$vm.lock"
+flock 9 || die "could not take the lock for $vm"
+
+if [[ "$(domstate)" == running ]] && "$NC" -z -w1 "$ip" "$port" 2>/dev/null; then
+    exec 9>&-
+    exec "$NC" "$ip" "$port"
+fi
+
+start_locked
+
+exec 9>&-
+exec "$NC" "$ip" "$port"
