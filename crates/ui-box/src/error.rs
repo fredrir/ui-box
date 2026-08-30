@@ -42,6 +42,34 @@ impl SessionError {
 }
 
 #[derive(Debug, Error)]
+pub enum FlowError {
+    #[error(
+        "flow {path} asserts nothing: {steps} steps of navigation and snapshots, and no \
+         assert_text or assert_absent among them. It would pass against a blank page, which \
+         makes it a transcript rather than a test. Add an assertion, or record a run that \
+         snapshots the state you care about and let `ui-box record` derive one"
+    )]
+    AssertsNothing { path: String, steps: usize },
+
+    #[error(
+        "wrote {path}, but it asserts nothing: {snaps} snapshot(s) and no text stable enough \
+         to assert on. A flow of clicks and snaps passes against a blank page. Snap a state \
+         with a heading or a label in it and record again, or add assert_text by hand"
+    )]
+    RecordedNothing { path: String, snaps: usize },
+}
+
+impl FlowError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            FlowError::AssertsNothing { .. } | FlowError::RecordedNothing { .. } => {
+                "flow_asserts_nothing"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum ForwardError {
     #[error(
         "target {target} points at port {port} on {lab}, because {host} inside a target is \
@@ -77,15 +105,30 @@ pub enum ForwardError {
     },
 
     #[error(
+        "session {session} already holds port {port} on {lab}, so this run could not bind it. \
+         The UI was never asked. Close that session and retry:\n    \
+         ui-box close {session}{}",
+        detail(.log)
+    )]
+    HeldBySession {
+        session: String,
+        port: u16,
+        lab: String,
+        log: Option<String>,
+    },
+
+    #[error(
         "{lab} refused the forward for port {ports} and the driver's ssh exited without \
-         opening a session. The UI was never asked. Three things do this: another session \
-         already holds {ports} on {lab}, a lingering ssh master from a session closed within \
-         the last minute still holds it, or sshd on {lab} refuses forwarding.{}",
+         opening a session. The UI was never asked. No ui-box session on this machine holds \
+         it, which leaves an ssh master still holding the port{}, a process outside ui-box \
+         listening on it, or sshd on {lab} refusing forwarding.{}",
+        persistence(.control_persist),
         detail(.log)
     )]
     Refused {
         ports: String,
         lab: String,
+        control_persist: Option<String>,
         log: Option<String>,
     },
 
@@ -108,6 +151,7 @@ impl ForwardError {
             ForwardError::Missing { .. } => "forward_missing",
             ForwardError::LocalClosed { .. } => "forward_unreachable",
             ForwardError::LocalIpv6Only { .. } => "forward_ipv6_only",
+            ForwardError::HeldBySession { .. } => "forward_held",
             ForwardError::Refused { .. } => "forward_refused",
             ForwardError::OwnTransport { .. } => "forward_unsupported",
         }
@@ -161,6 +205,13 @@ impl DriverError {
     }
 }
 
+fn persistence(value: &Option<String>) -> String {
+    match value {
+        Some(seconds) => format!(" for up to {seconds} after the session that made it closed"),
+        None => " briefly after the session that made it closed".to_string(),
+    }
+}
+
 fn detail(value: &Option<String>) -> String {
     match value {
         Some(value) if !value.trim().is_empty() => format!("\n{}", value.trim_end()),
@@ -175,6 +226,9 @@ pub fn kind_of(error: &anyhow::Error) -> &'static str {
         }
         if let Some(session) = cause.downcast_ref::<SessionError>() {
             return session.kind();
+        }
+        if let Some(flow) = cause.downcast_ref::<FlowError>() {
+            return flow.kind();
         }
         if let Some(forward) = cause.downcast_ref::<ForwardError>() {
             return forward.kind();

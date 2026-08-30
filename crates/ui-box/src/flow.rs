@@ -99,6 +99,7 @@ pub enum Step {
     Key(String),
     WaitFor(String),
     AssertText(String),
+    AssertAbsent(String),
     Snap(SnapStep),
 }
 
@@ -111,8 +112,13 @@ impl Step {
             Step::Key(_) => "key",
             Step::WaitFor(_) => "wait_for",
             Step::AssertText(_) => "assert_text",
+            Step::AssertAbsent(_) => "assert_absent",
             Step::Snap(_) => "snap",
         }
+    }
+
+    pub fn is_assertion(&self) -> bool {
+        matches!(self, Step::AssertText(_) | Step::AssertAbsent(_))
     }
 
     pub fn snap(&self) -> Option<&SnapStep> {
@@ -139,6 +145,7 @@ impl Step {
             Step::Key(key) => format!("key {key}"),
             Step::WaitFor(selector) => format!("wait_for {selector}"),
             Step::AssertText(selector) => format!("assert_text {selector}"),
+            Step::AssertAbsent(selector) => format!("assert_absent {selector}"),
             Step::Snap(snap) => match snap.name() {
                 Some(name) => format!("snap {name}"),
                 None => "snap".to_string(),
@@ -154,6 +161,7 @@ pub const VERBS: &[&str] = &[
     "key",
     "wait_for",
     "assert_text",
+    "assert_absent",
     "snap",
 ];
 
@@ -167,6 +175,7 @@ impl Serialize for Step {
             Step::Key(key) => map.serialize_entry("key", key)?,
             Step::WaitFor(selector) => map.serialize_entry("wait_for", selector)?,
             Step::AssertText(selector) => map.serialize_entry("assert_text", selector)?,
+            Step::AssertAbsent(selector) => map.serialize_entry("assert_absent", selector)?,
             Step::Snap(snap) => map.serialize_entry("snap", snap)?,
         }
         map.end()
@@ -199,6 +208,7 @@ impl<'de> Visitor<'de> for StepVisitor {
             "key" => Step::Key(map.next_value()?),
             "wait_for" => Step::WaitFor(map.next_value()?),
             "assert_text" => Step::AssertText(map.next_value()?),
+            "assert_absent" => Step::AssertAbsent(map.next_value()?),
             "snap" => Step::Snap(map.next_value()?),
             other => return Err(de::Error::unknown_variant(other, VERBS)),
         };
@@ -222,6 +232,7 @@ pub fn parse_positional(tokens: &[String]) -> Result<Step> {
         "key" => Step::Key(exactly_one(rest, "key KEY")?),
         "wait_for" => Step::WaitFor(exactly_one(rest, "wait_for SELECTOR")?),
         "assert_text" => Step::AssertText(exactly_one(rest, "assert_text SELECTOR")?),
+        "assert_absent" => Step::AssertAbsent(exactly_one(rest, "assert_absent SELECTOR")?),
         "type" => {
             if rest.len() != 2 {
                 bail!("type takes a selector and a text, as in `type \"css=#email\" \"a@b.c\"`");
@@ -304,6 +315,18 @@ impl Flow {
             seen.push(name);
         }
         Ok(())
+    }
+
+    pub fn assertions(&self) -> usize {
+        self.steps.iter().filter(|step| step.is_assertion()).count()
+    }
+
+    pub fn image_snaps(&self) -> usize {
+        self.steps
+            .iter()
+            .filter_map(Step::snap)
+            .filter(|snap| matches!(snap.mode(), Some(SnapMode::Png) | Some(SnapMode::Both)))
+            .count()
     }
 
     pub fn to_yaml(&self) -> Result<String> {
@@ -444,6 +467,46 @@ steps:
     fn rejects_an_unknown_verb() {
         let err = serde_yaml::from_str::<Step>("swipe: left").unwrap_err();
         assert!(err.to_string().contains("swipe"), "{err}");
+    }
+
+    #[test]
+    fn a_flow_of_clicks_and_snaps_asserts_nothing() {
+        let flow: Flow = serde_yaml::from_str(
+            "version: 1\nflow: f\nsurface: web\ntarget: http://x\nsteps:\n  \
+             - click: \"css=#go\"\n  - snap: { name: after }\n",
+        )
+        .unwrap();
+        assert_eq!(flow.assertions(), 0);
+        assert_eq!(flow.image_snaps(), 0);
+
+        let guarded: Flow = serde_yaml::from_str(SAMPLE).unwrap();
+        assert_eq!(guarded.assertions(), 1);
+    }
+
+    #[test]
+    fn a_negative_assertion_is_part_of_the_vocabulary() {
+        let step: Step =
+            serde_yaml::from_str("assert_absent: \"role=button[name=Clear]\"").unwrap();
+        assert_eq!(step, Step::AssertAbsent("role=button[name=Clear]".into()));
+        assert!(step.is_assertion());
+        assert_eq!(
+            step.to_yaml_entry().unwrap(),
+            "- assert_absent: role=button[name=Clear]\n"
+        );
+        assert_eq!(
+            parse_positional(&["assert_absent".to_string(), "css=#gone".to_string()]).unwrap(),
+            Step::AssertAbsent("css=#gone".into())
+        );
+    }
+
+    #[test]
+    fn a_png_snap_is_what_a_golden_can_pin() {
+        let flow: Flow = serde_yaml::from_str(
+            "version: 1\nflow: f\nsurface: web\ntarget: http://x\nsteps:\n  \
+             - snap: { name: a, mode: png }\n  - snap: { name: b }\n",
+        )
+        .unwrap();
+        assert_eq!(flow.image_snaps(), 1);
     }
 
     #[test]

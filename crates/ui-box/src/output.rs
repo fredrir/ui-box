@@ -64,6 +64,15 @@ impl Summary {
         }
     }
 
+    pub fn nothing(value: Value) -> Self {
+        Summary {
+            value,
+            ok: false,
+            exit_code: EXIT_PASS,
+            stream: Stream::Stdout,
+        }
+    }
+
     pub fn unusable(value: Value) -> Self {
         Summary {
             value,
@@ -150,10 +159,27 @@ mod tests {
     }
 
     #[test]
+    fn nothing_verified_is_not_a_pass_and_not_a_failure() {
+        let summary = Summary::nothing(json!({ "skipped": true }));
+        assert_eq!(
+            summary.exit_code(),
+            EXIT_PASS,
+            "nothing failed, so a gate must not go red"
+        );
+        let rendered: serde_json::Value =
+            serde_json::from_str(&summary.render()).expect("summary is json");
+        assert_eq!(
+            rendered["ok"], false,
+            "exit 0 alone would read as verified, which is the thing being fixed"
+        );
+    }
+
+    #[test]
     fn every_summary_carries_an_ok_field() {
         for summary in [
             Summary::ok(json!({})),
             Summary::failed(json!({})),
+            Summary::nothing(json!({})),
             Summary::unusable(json!({})),
         ] {
             let rendered: serde_json::Value =

@@ -3,8 +3,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+use crate::assertions;
 use crate::cli::{RecordArgs, RecordFormat, RunsArgs, ShowArgs, ShowWhat};
 use crate::config::{Config, Surface};
+use crate::error::FlowError;
 use crate::flow::Flow;
 use crate::note;
 use crate::output::Summary;
@@ -13,7 +15,9 @@ use crate::run::{list_runs, RunDir};
 
 pub fn record(config: &Config, args: &RecordArgs) -> Result<Summary> {
     let run = RunDir::open(&config.artifacts, &args.id)?;
-    let steps = run.read_steps()?;
+    let recorded = run.read_steps()?;
+    let snaps = recorded.iter().filter(|step| step.snap().is_some()).count();
+    let (steps, derived) = assertions::derive(&recorded, &run.snaps_dir());
     let meta = run.read_meta().ok();
 
     let surface = meta
@@ -44,6 +48,7 @@ pub fn record(config: &Config, args: &RecordArgs) -> Result<Summary> {
         steps,
     };
     let step_count = flow.steps.len();
+    let asserted = flow.assertions();
     let (rendered, default_name, format) = match args.format {
         RecordFormat::Uibox => (flow.to_yaml()?, "flow.yaml", "uibox"),
         RecordFormat::Playwright => (playwright::emit(&flow), "flow.spec.ts", "playwright"),
@@ -55,11 +60,20 @@ pub fn record(config: &Config, args: &RecordArgs) -> Result<Summary> {
         .unwrap_or_else(|| run.path.join(default_name));
     if destination == Path::new("-") {
         print!("{rendered}");
+        if asserted == 0 {
+            return Err(FlowError::RecordedNothing {
+                path: "-".to_string(),
+                snaps,
+            }
+            .into());
+        }
         return Ok(Summary::ok(json!({
             "run": run.id,
             "flow": flow.flow,
             "format": format,
             "steps": step_count,
+            "assertions": asserted,
+            "derived": derived,
             "out": "-",
         }))
         .on_stderr());
@@ -68,11 +82,21 @@ pub fn record(config: &Config, args: &RecordArgs) -> Result<Summary> {
     std::fs::write(&destination, &rendered)
         .with_context(|| format!("cannot write {}", destination.display()))?;
     note!("wrote {step_count} steps to {}", destination.display());
+    if asserted == 0 {
+        return Err(FlowError::RecordedNothing {
+            path: destination.display().to_string(),
+            snaps,
+        }
+        .into());
+    }
+    note!("derived {derived} assertion(s) from the snapshots this run captured");
     Ok(Summary::ok(json!({
         "run": run.id,
         "flow": flow.flow,
         "format": format,
         "steps": step_count,
+        "assertions": asserted,
+        "derived": derived,
         "out": destination,
     })))
 }

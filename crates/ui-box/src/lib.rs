@@ -1,3 +1,4 @@
+pub mod assertions;
 pub mod backend;
 pub mod cli;
 pub mod commands;

@@ -6,8 +6,10 @@ use anyhow::Result;
 
 use super::carries_own_transport;
 use crate::config::{Config, Forward, DEFAULT_FORWARD_HOST};
+use crate::driver::client::process_alive;
 use crate::error::ForwardError;
 use crate::note;
+use crate::session::SessionStore;
 
 pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_millis(300);
 
@@ -147,12 +149,61 @@ pub fn classify(error: anyhow::Error, config: &Config) -> anyhow::Error {
     if !matches_refusal(&rendered) {
         return error;
     }
+    if let Some((port, session)) = holding_session(config, &rendered) {
+        return ForwardError::HeldBySession {
+            session,
+            port,
+            lab: lab.to_string(),
+            log: refusal_lines(&rendered),
+        }
+        .into();
+    }
     ForwardError::Refused {
         ports: refused_ports(&config.forward, &rendered),
         lab: lab.to_string(),
+        control_persist: control_persist(lab),
         log: refusal_lines(&rendered),
     }
     .into()
+}
+
+fn holding_session(config: &Config, text: &str) -> Option<(u16, String)> {
+    let sessions = SessionStore::new(config).list().ok()?;
+    for forward in &config.forward {
+        if !text.contains(&forward.lab_port.to_string()) {
+            continue;
+        }
+        let prefix = format!("{DEFAULT_FORWARD_HOST}:{}:", forward.lab_port);
+        let held = sessions.iter().find(|record| {
+            process_alive(record.pid)
+                && record
+                    .driver_argv
+                    .iter()
+                    .any(|arg| arg.starts_with(&prefix))
+        });
+        if let Some(record) = held {
+            return Some((forward.lab_port, record.id.clone()));
+        }
+    }
+    None
+}
+
+fn control_persist(host: &str) -> Option<String> {
+    let output = std::process::Command::new("ssh")
+        .arg("-G")
+        .arg(host)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = text
+        .lines()
+        .find_map(|line| line.strip_prefix("controlpersist "))?
+        .trim();
+    match value {
+        "no" | "0" => None,
+        "yes" => Some("as long as it stays idle".to_string()),
+        seconds => seconds.parse::<u64>().ok().map(|held| format!("{held}s")),
+    }
 }
 
 fn preflight(forward: &Forward) -> Result<()> {
@@ -443,6 +494,82 @@ mod tests {
         let message = format!("{classified:#}");
         assert!(message.contains("3000"), "{message}");
         assert!(message.contains("dlab-ui"), "{message}");
+    }
+
+    fn live_session_holding(dir: &std::path::Path, port: u16) -> (Config, String) {
+        let config = crate::config::Config::resolve_from(
+            &crate::config::Overrides {
+                backend: Some("ssh://fredrir@dlab-ui".to_string()),
+                forward: vec![port.to_string()],
+                artifacts: Some(dir.to_path_buf()),
+                ..Default::default()
+            },
+            std::path::Path::new("/"),
+        )
+        .expect("config");
+
+        let id = "20260830T000000Z-abcdef01".to_string();
+        let record = crate::session::SessionRecord {
+            id: id.clone(),
+            driver_session: "d1".to_string(),
+            driver_name: "dom@dlab-ui".to_string(),
+            driver_argv: super::super::remote_argv(
+                "fredrir@dlab-ui",
+                &["ui-box-dom".to_string()],
+                &config.forward,
+            ),
+            pid: std::process::id(),
+            surface: crate::config::Surface::Web,
+            target: "http://localhost:3000".to_string(),
+            viewport: config.viewport,
+            backend: config.backend.url(),
+            run_dir: dir.to_path_buf(),
+            remote_run_dir: None,
+            session_dir: dir.join("session"),
+            created_unix: 0,
+            last_used_unix: 0,
+            ttl_secs: 900,
+            step_count: 0,
+        };
+        SessionStore::new(&config).save(&record).expect("session");
+        (config, id)
+    }
+
+    #[test]
+    fn a_port_held_by_a_live_session_names_that_session() {
+        let dir = std::env::temp_dir().join(format!("uibox-holder-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (config, id) = live_session_holding(&dir, 3000);
+
+        let raw = anyhow::anyhow!(
+            "driver dom@dlab-ui exited before answering info\n\
+             Warning: remote port forwarding failed for listen port 3000"
+        );
+        let classified = classify(raw, &config);
+        assert_eq!(crate::error::kind_of(&classified), "forward_held");
+        let message = format!("{classified:#}");
+        assert!(message.contains(&id), "{message}");
+        assert!(message.contains(&format!("ui-box close {id}")), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_port_no_session_holds_still_lists_what_else_could_hold_it() {
+        let dir = std::env::temp_dir().join(format!("uibox-noholder-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (config, _) = live_session_holding(&dir, 4000);
+
+        let raw = anyhow::anyhow!(
+            "driver dom@dlab-ui exited before answering info\n\
+             Warning: remote port forwarding failed for listen port 4000"
+        );
+        std::fs::remove_dir_all(config.sessions_dir()).ok();
+        let classified = classify(raw, &config);
+        assert_eq!(crate::error::kind_of(&classified), "forward_refused");
+        assert!(format!("{classified:#}").contains("4000"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -54,8 +54,9 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     const out = { name, console: [], network: [] };
     if (req.params.mode !== 'png') {
       const p = path.join(dir, name + '.txt');
-      fs.writeFileSync(p, 'tree\n');
-      out.text = 'tree\n';
+      const tree = '- heading "Costs" [level=1]:\n  - text: all \u00b7 11\n';
+      fs.writeFileSync(p, tree);
+      out.text = tree;
       out.txtPath = p;
     }
     if (req.params.mode !== 'text') {
@@ -138,7 +139,10 @@ fn flow(dir: &Path, body: &str) -> String {
 
 const FOUR_STEPS: &str = "version: 1\nflow: gate\nsurface: web\ntarget: http://x/\nsteps:\n  \
      - click: \"css=#one\"\n  - click: \"css=#fail\"\n  - click: \"css=#three\"\n  \
-     - click: \"css=#four\"\n";
+     - click: \"css=#four\"\n  - assert_text: \"text=done\"\n";
+
+const NO_ASSERTIONS: &str = "version: 1\nflow: transcript\nsurface: web\ntarget: http://x/\n\
+     steps:\n  - click: \"css=#one\"\n  - snap: { name: after }\n";
 
 #[test]
 fn a_failing_step_halts_the_flow_before_the_rest_run() {
@@ -165,7 +169,7 @@ fn keep_going_runs_the_steps_after_a_failure() {
     let path = flow(&dir, FOUR_STEPS);
     let body = summary(&ui_box(&dir, &["run", &path, "--keep-going"]));
     assert_eq!(body["verdict"], "fail");
-    assert_eq!(body["steps_total"], 4);
+    assert_eq!(body["steps_total"], 5);
     assert_eq!(body["halted_at"], serde_json::Value::Null);
 }
 
@@ -332,4 +336,111 @@ fn a_forward_resolves_cli_over_environment_over_project_file() {
         ),
         vec!["5000", "6000"]
     );
+}
+
+#[test]
+fn a_flow_that_asserts_nothing_is_refused_before_the_driver_starts() {
+    let dir = workspace("asserts-nothing");
+    let path = flow(&dir, NO_ASSERTIONS);
+    let output = ui_box(&dir, &["run", &path]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a transcript is not a failing test, it is an input ui-box cannot verify with"
+    );
+    let body = summary(&output);
+    assert_eq!(body["error_kind"], "flow_asserts_nothing");
+    let message = body["error"].as_str().expect("error");
+    assert!(message.contains("blank page"), "{message}");
+    assert!(
+        !dir.join("runs").exists(),
+        "the refusal must precede the run directory, or it costs a driver to say no"
+    );
+}
+
+#[test]
+fn a_recorded_flow_asserts_what_the_run_observed() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("record-asserts");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+    ui_box(&dir, &["act", &session, "click", "css=#one"]);
+    ui_box(&dir, &["snap", &session, "--name", "after"]);
+    ui_box(&dir, &["close", &session]);
+
+    let recorded = summary(&ui_box(&dir, &["record", &session]));
+    assert!(
+        recorded["assertions"].as_u64().unwrap_or(0) >= 1,
+        "a recorded flow that asserts nothing is green forever: {recorded}"
+    );
+    assert!(recorded["derived"].as_u64().unwrap_or(0) >= 1);
+
+    let written = std::fs::read_to_string(recorded["out"].as_str().expect("out")).expect("flow");
+    assert!(written.contains("assert_text"), "{written}");
+    assert!(written.contains("Costs"), "{written}");
+}
+
+#[test]
+fn a_recording_with_nothing_to_assert_is_not_offered_as_a_test() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("record-nothing");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+    ui_box(&dir, &["act", &session, "click", "css=#one"]);
+    ui_box(&dir, &["close", &session]);
+
+    let output = ui_box(&dir, &["record", &session]);
+    assert_eq!(output.status.code(), Some(2));
+    let body = summary(&output);
+    assert_eq!(body["error_kind"], "flow_asserts_nothing");
+
+    let run_dir = PathBuf::from(opened["run_dir"].as_str().expect("run_dir"));
+    assert!(
+        run_dir.join("flow.yaml").is_file(),
+        "the transcript is still written, so a long session is not lost to the refusal"
+    );
+}
+
+#[test]
+fn a_replayed_flow_carries_its_derived_assertion() {
+    if !node_available() {
+        return;
+    }
+    let dir = workspace("record-replay");
+    let opened = summary(&ui_box(&dir, &["open", "http://x/"]));
+    let session = opened["session"].as_str().expect("session").to_string();
+    ui_box(&dir, &["snap", &session, "--name", "after"]);
+    ui_box(&dir, &["close", &session]);
+
+    let recorded = summary(&ui_box(&dir, &["record", &session]));
+    let written = recorded["out"].as_str().expect("out").to_string();
+    let replayed = summary(&ui_box(&dir, &["run", &written]));
+    assert_eq!(replayed["verdict"], "pass", "{replayed}");
+}
+
+#[test]
+fn a_verify_that_replayed_nothing_is_not_reported_as_a_pass() {
+    let dir = workspace("nothing-verified");
+    let empty = dir.join("no-flows");
+    std::fs::create_dir_all(&empty).expect("flows dir");
+    let output = ui_box(&dir, &["verify", "--flows", &empty.display().to_string()]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "nothing failed, so a pre-push gate must not go red on a project with no flows yet"
+    );
+    let body = summary(&output);
+    assert_eq!(
+        body["ok"], false,
+        "exit 0 on its own reads as verified, which is the bug"
+    );
+    assert_eq!(body["status"], "nothing_verified");
+    assert_eq!(body["skipped"], true);
+    assert_eq!(body["flows"], 0);
 }

@@ -40,6 +40,9 @@ fn line(step: &Step) -> String {
         Step::AssertText(selector) => {
             format!("  await expect({}).toBeVisible();\n", locator(selector))
         }
+        Step::AssertAbsent(selector) => {
+            format!("  await expect({}).toHaveCount(0);\n", locator(selector))
+        }
         Step::Snap(snap) => format!(
             "  await page.screenshot({{ path: '{}.png' }});\n",
             escape(snap.name().unwrap_or("snapshot"))
@@ -47,12 +50,31 @@ fn line(step: &Step) -> String {
     }
 }
 
+fn unquote(value: &str) -> String {
+    let trimmed = value.trim();
+    let Some(inner) = trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return trimmed.to_string();
+    };
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => out.push(chars.next().unwrap_or('\\')),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub fn locator(selector: &str) -> String {
     if let Some(css) = selector.strip_prefix("css=") {
         return format!("page.locator('{}')", escape(css));
     }
     if let Some(text) = selector.strip_prefix("text=") {
-        return format!("page.getByText('{}')", escape(text));
+        return format!("page.getByText('{}')", escape(&unquote(text)));
     }
     if let Some(role) = selector.strip_prefix("role=") {
         let (role, name) = split_role(role);

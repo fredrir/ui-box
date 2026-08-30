@@ -11,6 +11,7 @@ use crate::backend;
 use crate::cli::{RunArgs, VerifyArgs};
 use crate::config::{Config, Forward, Viewport};
 use crate::driver::{self, forward, Connection};
+use crate::error::FlowError;
 use crate::flow::{Flow, Step};
 use crate::note;
 use crate::output::Summary;
@@ -34,22 +35,33 @@ pub fn run(config: &Config, args: &RunArgs) -> Result<Summary> {
 pub fn verify(config: &Config, args: &VerifyArgs) -> Result<Summary> {
     if let Some(since) = &args.since {
         if !moved_since(since) {
-            note!("nothing changed since {since}, skipping verification");
-            return Ok(Summary::ok(json!({
+            note!("nothing verified: the tree has not moved since {since}");
+            note!("exit 0 here means no work was done, not that the UI is correct");
+            return Ok(Summary::nothing(json!({
+                "status": "nothing_verified",
                 "skipped": true,
+                "flows": 0,
                 "since": since,
-                "reason": "the tree has not moved since this ref",
+                "reason": "the tree has not moved since this ref, so no flow was replayed \
+                           and no UI was exercised",
             })));
         }
     }
 
     let flows = discover_flows(config, args)?;
     if flows.is_empty() {
-        note!("no flows to verify");
-        return Ok(Summary::ok(json!({
+        let looked_in = flows_dir(config, args);
+        note!(
+            "nothing verified: no flows found in {}",
+            looked_in.display()
+        );
+        note!("exit 0 here means no work was done, not that the UI is correct");
+        return Ok(Summary::nothing(json!({
+            "status": "nothing_verified",
             "skipped": true,
-            "reason": "no flows found",
-            "looked_in": flows_dir(config, args),
+            "flows": 0,
+            "reason": "no flow files were found, so none was replayed and no UI was exercised",
+            "looked_in": looked_in,
         })));
     }
 
@@ -94,6 +106,13 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
         .clone()
         .context("no flow: pass a step-format yaml file, e.g. `ui-box run flows/checkout.yaml`")?;
     let flow = Flow::load(&flow_path)?;
+    if flow.assertions() == 0 && !pinned_by_goldens(config, verify, &flow) {
+        return Err(FlowError::AssertsNothing {
+            path: flow_path.display().to_string(),
+            steps: flow.steps.len(),
+        }
+        .into());
+    }
     let mut skipped: Option<String> = None;
     let surface = args.surface.unwrap_or(flow.surface);
     let viewport = match args.viewport.as_ref().or(flow.viewport.as_ref()) {
@@ -286,6 +305,10 @@ fn execute(config: &Config, args: &RunArgs, verify: Option<&VerifyArgs>) -> Resu
         meta.steps_total
     );
     Ok(Outcome { body, passed })
+}
+
+fn pinned_by_goldens(config: &Config, verify: Option<&VerifyArgs>, flow: &Flow) -> bool {
+    verify.is_some() && config.goldens.is_some() && flow.image_snaps() > 0
 }
 
 enum Placed {
