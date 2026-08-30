@@ -318,6 +318,18 @@ Tool names and parameter names are frozen. Descriptions are NOT: they are prose,
 they are rewritten whenever they can be made shorter, and they cost every
 session that connects whether it calls the tool or not.
 
+A parameter is its CLI flag without the dashes, same grammar:
+
+    ui_open, ui_run   forward   array of §4 specs, e.g. ["3000:5173"]
+    ui_snap           mode      text | png | both | layout
+    ui_snap           clip      SEL, crops the png, so mode must produce one
+    ui_act            action    every §2 verb, assert_absent and assert_visible included
+
+A verb §2 lists and `action` rejects is §8 aimed at ui-box itself: the schema
+advertises a vocabulary smaller than the contract, and the caller cannot tell a
+verb that does not exist from one the schema forgot. `steps` is the batch form,
+not the escape hatch that gap made it.
+
 Every result carries `status` and `failure_domain`. `failure_domain` separates
 `ui_test_failed` from `uibox_unusable` and is the MCP equivalent of the
 three-valued exit code above -- a consumer that ignores it reproduces §8 exactly,

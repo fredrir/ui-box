@@ -119,6 +119,7 @@ impl UiBoxServer {
             argv.push("--name".to_string());
             argv.push(name.to_string());
         }
+        push_option(&mut argv, "--clip", request.clip);
 
         let invocation = self.uibox.call(argv, request.cwd).await;
         let snap = invocation.field("snap").unwrap_or(Value::Null);
@@ -310,6 +311,7 @@ impl UiBoxServer {
         push_option(&mut argv, "--surface", args.surface.as_deref());
         push_option(&mut argv, "--viewport", args.viewport.as_deref());
         push_option(&mut argv, "--flow", args.flow.as_deref());
+        push_each(&mut argv, "--forward", &args.forward);
 
         let opened = self.uibox.call(argv, cwd).await;
         let session = opened.text("session");
@@ -341,6 +343,7 @@ impl UiBoxServer {
                 session: &session,
                 mode: "text",
                 name: Some("open"),
+                clip: None,
                 max_chars: args.max_chars.unwrap_or(DEFAULT_MAX_CHARS),
                 want_image: false,
                 cwd,
@@ -436,6 +439,7 @@ impl UiBoxServer {
                 session: &args.session,
                 mode: "both",
                 name: Some(if nothing { "proved-nothing" } else { "failed" }),
+                clip: None,
                 max_chars: args.max_chars.unwrap_or(DEFAULT_MAX_CHARS),
                 want_image: true,
                 cwd,
@@ -457,13 +461,14 @@ impl UiBoxServer {
             ("text", Some(true)) => "both",
             (other, _) => other,
         };
-        let want_image = mode != "text" && args.include_image != Some(false);
+        let want_image = matches!(mode, "png" | "both") && args.include_image != Some(false);
 
         let capture = self
             .capture(CaptureRequest {
                 session: &args.session,
                 mode,
                 name: args.name.as_deref(),
+                clip: args.clip.as_deref(),
                 max_chars: args.max_chars.unwrap_or(DEFAULT_MAX_CHARS),
                 want_image,
                 cwd,
@@ -586,6 +591,7 @@ impl UiBoxServer {
         push_option(&mut argv, "--surface", args.surface.as_deref());
         push_option(&mut argv, "--target", args.target.as_deref());
         push_option(&mut argv, "--viewport", args.viewport.as_deref());
+        push_each(&mut argv, "--forward", &args.forward);
         if args.lab_checkout {
             argv.push("--lab-checkout".to_string());
         }
@@ -1048,6 +1054,7 @@ struct CaptureRequest<'a> {
     session: &'a str,
     mode: &'a str,
     name: Option<&'a str>,
+    clip: Option<&'a str>,
     max_chars: usize,
     want_image: bool,
     cwd: Option<&'a Path>,
@@ -1171,6 +1178,13 @@ fn push_option(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
     }
 }
 
+fn push_each(argv: &mut Vec<String>, flag: &str, values: &[String]) {
+    for value in values {
+        argv.push(flag.to_string());
+        argv.push(value.clone());
+    }
+}
+
 fn proved_nothing(invocation: &Invocation) -> bool {
     invocation.text("status").as_deref() == Some(outcome::NOTHING_STATUS)
 }
@@ -1207,6 +1221,7 @@ struct OpenArgs {
     surface: Option<String>,
     viewport: Option<String>,
     flow: Option<String>,
+    forward: Vec<String>,
     snapshot: Option<bool>,
     max_chars: Option<usize>,
     project_dir: Option<PathBuf>,
@@ -1268,6 +1283,8 @@ struct SnapArgs {
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
+    clip: Option<String>,
+    #[serde(default)]
     include_image: Option<bool>,
     #[serde(default)]
     max_chars: Option<usize>,
@@ -1311,6 +1328,7 @@ struct RecordArgs {
 #[serde(default)]
 struct RunArgs {
     flow: Option<String>,
+    forward: Vec<String>,
     lab: Option<String>,
     project: Option<String>,
     build: Option<String>,
@@ -1435,8 +1453,8 @@ fn build_step(
             "wait_for".to_string(),
             Value::from(need(selector, "a `selector`")?),
         )])),
-        "assert_text" => Value::from(Map::from_iter([(
-            "assert_text".to_string(),
+        "assert_text" | "assert_absent" | "assert_visible" => Value::from(Map::from_iter([(
+            action.to_string(),
             Value::from(need(selector, "a `selector`")?),
         )])),
         "snap" => {
@@ -1449,7 +1467,8 @@ fn build_step(
         other => {
             return Err(format!(
                 "unknown action {other:?}, expected one of \
-                 open, click, type, key, wait_for, assert_text, snap"
+                 open, click, type, key, wait_for, assert_text, assert_absent, \
+                 assert_visible, snap"
             ))
         }
     };
@@ -1482,6 +1501,27 @@ mod tests {
 
         let passed = acted(r#"{"ok":true,"status":"passed","step_ok":true}"#);
         assert!(!proved_nothing(&passed));
+    }
+
+    #[test]
+    fn every_verb_the_step_format_lists_is_reachable_from_action() {
+        let verbs = [
+            "open",
+            "click",
+            "type",
+            "key",
+            "wait_for",
+            "assert_text",
+            "assert_absent",
+            "assert_visible",
+            "snap",
+        ];
+        for verb in verbs {
+            let step = build_step(verb, Some("css=#x"), Some("t"), Some("t"), Some("k"), None)
+                .unwrap_or_else(|reason| panic!("{verb}: {reason}"));
+            assert!(step.get(verb).is_some(), "{verb} built {step}");
+        }
+        assert!(build_step("assert_gone", Some("css=#x"), None, None, None, None).is_err());
     }
 
     #[test]

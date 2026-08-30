@@ -21,10 +21,9 @@ ui-box drives a real UI inside the dlab-ui lab (a NixOS VM with Xvfb and Playwri
 reports back as text. You stay here; the UI does not.
 
 `localhost` in a target is the LAB's loopback. A dev server you started here is not on
-it until a forward publishes it: `forward = \"3000:5173\"` in uibox.toml, or UIBOX_FORWARD
-in this server's environment. The first number is the one in your URL, because the URL
-resolves inside the lab. A loopback target with no covering forward is REFUSED -- that
-refusal is not an application bug.
+it until a forward publishes it: `forward: [\"3000:5173\"]` on ui_open or ui_run. The
+first number is the one in your URL, because the URL resolves inside the lab. A loopback
+target with no covering forward is REFUSED -- that refusal is not an application bug.
 
 Loop: ui_test_prepare, ui_open, then ui_act / ui_snap / ui_eval, then ui_close.
 ui_record freezes a session into a flow file, ui_run replays it, ui_verify is the gate
@@ -62,6 +61,14 @@ fn project_dir() -> Value {
 
 fn max_chars() -> Value {
     json!({ "type": "integer", "minimum": 200 })
+}
+
+fn forward() -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Publish a local port into the lab, lab port first: \"3000\", \"3000:5173\", \"3000:HOST:5173\"."
+    })
 }
 
 fn pipeline() -> Value {
@@ -121,6 +128,7 @@ pub fn tools() -> Vec<Tool> {
                     "surface": { "type": "string", "enum": ["web", "tauri", "tui"], "description": "Default web." },
                     "viewport": { "type": "string", "pattern": "^[0-9]+x[0-9]+$" },
                     "flow": { "type": "string", "description": "Flow name ui_record reuses." },
+                    "forward": forward(),
                     "snapshot": { "type": "boolean" },
                     "max_chars": max_chars(),
                     "project_dir": project_dir()
@@ -139,8 +147,8 @@ pub fn tools() -> Vec<Tool> {
                     "session": { "type": "string" },
                     "action": {
                         "type": "string",
-                        "enum": ["open", "click", "type", "key", "wait_for", "assert_text", "snap"],
-                        "description": "By verb: click/wait_for/assert_text -> selector; type -> selector+text; key -> key; open -> target; snap -> name. Ignored with `steps`."
+                        "enum": ["open", "click", "type", "key", "wait_for", "assert_text", "assert_absent", "assert_visible", "snap"],
+                        "description": "By verb: click/wait_for/assert_* -> selector; type -> selector+text; key -> key; open -> target; snap -> name. Ignored with `steps`."
                     },
                     "selector": { "type": "string", "description": "css=SEL, role=ROLE, text=STR; tui also re=REGEX and cell=R,C." },
                     "text": { "type": "string" },
@@ -149,7 +157,7 @@ pub fn tools() -> Vec<Tool> {
                     "name": { "type": "string" },
                     "steps": {
                         "type": "array",
-                        "description": "Flat [{\"action\":\"click\",\"selector\":\"...\"}], or raw one-verb nodes [{\"click\":\"role=button[name=Submit]\"}] which also reach verbs `action` lacks, such as assert_absent.",
+                        "description": "Flat [{\"action\":\"click\",\"selector\":\"...\"}], or raw one-verb nodes [{\"click\":\"role=button[name=Submit]\"}].",
                         "items": { "type": "object" }
                     },
                     "snapshot_on_failure": { "type": "boolean" },
@@ -170,7 +178,8 @@ pub fn tools() -> Vec<Tool> {
                 "properties": {
                     "session": { "type": "string" },
                     "name": { "type": "string" },
-                    "mode": { "type": "string", "enum": ["text", "png", "both"], "description": "Default text." },
+                    "mode": { "type": "string", "enum": ["text", "png", "both", "layout"], "description": "Default text. layout is text plus bounding boxes." },
+                    "clip": { "type": "string", "description": "Crop the png to an element, e.g. css=#chart. Needs mode png or both." },
                     "include_image": { "type": "boolean", "description": "Inline the screenshot; promotes mode text to both." },
                     "max_chars": max_chars(),
                     "project_dir": project_dir()
@@ -238,6 +247,7 @@ pub fn tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": merge(pipeline(), json!({
                     "flow": { "type": "string", "description": "e.g. flows/checkout.yaml." },
+                    "forward": forward(),
                     "surface": { "type": "string", "enum": ["web", "tauri", "tui"] },
                     "target": { "type": "string", "description": "Override the flow's target." },
                     "viewport": { "type": "string", "pattern": "^[0-9]+x[0-9]+$" },
@@ -310,6 +320,7 @@ mod tests {
             OPEN,
             &[
                 "flow",
+                "forward",
                 "max_chars",
                 "project_dir",
                 "snapshot",
@@ -337,6 +348,7 @@ mod tests {
         (
             SNAP,
             &[
+                "clip",
                 "include_image",
                 "max_chars",
                 "mode",
@@ -358,6 +370,7 @@ mod tests {
                 "build",
                 "flow",
                 "force",
+                "forward",
                 "include_image",
                 "keep_going",
                 "lab",
