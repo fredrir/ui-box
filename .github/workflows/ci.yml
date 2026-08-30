@@ -120,9 +120,10 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@v17
 
-      # Evaluation only. Building the packages here would cost far more than the
-      # whole rest of CI; the release workflow is where they get built.
       - run: nix flake check --all-systems --no-build --no-write-lock-file
+
+      # flake check only evaluates packages, so the sandbox build needs its own step.
+      - run: nix build --no-link --no-write-lock-file .#ui-box-unwrapped
 
   ci:
     name: ci
