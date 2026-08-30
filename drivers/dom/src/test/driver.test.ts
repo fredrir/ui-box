@@ -219,7 +219,7 @@ describe("dom driver", { timeout: 120_000 }, () => {
   test("eval returns a serialized value", async () => {
     const { sessionId } = await client.call("driver.open", { target: fixture.url("/ok") });
     const result = await client.call("driver.eval", { sessionId, expr: "document.title" });
-    assert.deepEqual(result, { value: "Checkout" });
+    assert.deepEqual(result, { value: "Checkout", kind: "string", serializable: true });
     await client.call("driver.close", { sessionId });
   });
 
